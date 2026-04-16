@@ -8,3 +8,9 @@ node_modules/
 dist/
 out/
 *.vsix
+.legacylens.local.json
+.legacylens.json
+.idea/
+.vscode/
+uv.lock
+src/legacylens.egg-info/

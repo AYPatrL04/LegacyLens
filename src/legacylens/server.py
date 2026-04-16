@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -9,6 +11,9 @@ from typing import Any
 from .engine import LegacyLensEngine
 from .llm import DEFAULT_OLLAMA_HOST, list_ollama_models
 from .models import AnalysisRequest
+
+
+LOGGER = logging.getLogger("legacylens.server")
 
 
 class LegacyLensRequestHandler(BaseHTTPRequestHandler):
@@ -110,11 +115,26 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.OK, {"jsonrpc": "2.0", "id": rpc_id, "result": response.to_dict()})
 
     def _handle_models(self) -> None:
-        host = self.engine.explainer.model_status().get("host") or DEFAULT_OLLAMA_HOST
+        status = self.engine.explainer.model_status()
+        if status.get("provider") == "api":
+            selected = status.get("model")
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "provider": "api",
+                    "models": [selected] if selected else [],
+                    "selected": selected,
+                    "llm": status,
+                },
+            )
+            return
+
+        host = status.get("host") or DEFAULT_OLLAMA_HOST
         try:
-            self._send_json(HTTPStatus.OK, {"models": list_ollama_models(str(host))})
+            models = list_ollama_models(str(host))
+            self._send_json(HTTPStatus.OK, {"provider": "ollama", "models": models, "selected": status.get("model"), "llm": status})
         except OSError as exc:
-            self._send_json(HTTPStatus.OK, {"models": [], "error": str(exc)})
+            self._send_json(HTTPStatus.OK, {"provider": "ollama", "models": [], "selected": status.get("model"), "llm": status, "error": str(exc)})
 
     def _read_json(self) -> dict[str, Any]:
         try:
@@ -160,7 +180,9 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8765) -> None:
+    _configure_logging()
     httpd = ThreadingHTTPServer((host, port), LegacyLensRequestHandler)
+    LOGGER.info("backend listening url=http://%s:%s", host, port)
     print(f"Legacy Lens backend listening on http://{host}:{port}")
     httpd.serve_forever()
 
@@ -172,6 +194,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     run_server(host=args.host, port=args.port)
     return 0
+
+
+def _configure_logging() -> None:
+    level_name = os.environ.get("LEGACYLENS_LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
 
 if __name__ == "__main__":

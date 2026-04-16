@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import sys
 from pathlib import Path
 
 from .engine import LegacyLensEngine
-from .llm import DEFAULT_OLLAMA_HOST, list_ollama_models, select_preferred_model
+from .llm import DEFAULT_OLLAMA_HOST, Explainer, list_ollama_models, select_preferred_model
 from .models import AnalysisRequest
 from .server import run_server
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_logging()
     parser = argparse.ArgumentParser(prog="legacylens", description="Explain legacy code idioms.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -20,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     analyze_parser.add_argument("--language", help="Override language detection.")
     analyze_parser.add_argument("--cursor-line", type=int, help="Rank findings near this one-based line.")
     analyze_parser.add_argument("--max-findings", type=int, default=8)
-    analyze_parser.add_argument("--use-llm", action="store_true", help="Use Ollama when LEGACYLENS_OLLAMA_MODEL is set.")
+    analyze_parser.add_argument("--use-llm", action="store_true", help="Use the configured LLM provider.")
     analyze_parser.add_argument(
         "--context-scope",
         choices=("none", "directory", "project"),
@@ -34,8 +37,8 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
 
-    models_parser = subparsers.add_parser("models", help="List Ollama models visible to Legacy Lens.")
-    models_parser.add_argument("--host", default=DEFAULT_OLLAMA_HOST)
+    models_parser = subparsers.add_parser("models", help="Show configured LLM model status.")
+    models_parser.add_argument("--host", default=None, help="Ollama host override.")
 
     args = parser.parse_args(argv)
     if args.command == "serve":
@@ -76,8 +79,33 @@ def _analyze_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _configure_logging() -> None:
+    level_name = os.environ.get("LEGACYLENS_LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+
 def _models_command(args: argparse.Namespace) -> int:
-    models = list_ollama_models(args.host)
-    selected = select_preferred_model(models)
-    print(json.dumps({"models": models, "selected": selected}, ensure_ascii=False, indent=2))
+    status = Explainer().model_status()
+    if status.get("provider") == "api" and not args.host:
+        selected = status.get("model")
+        print(
+            json.dumps(
+                {"provider": "api", "models": [selected] if selected else [], "selected": selected, "llm": status},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    host = args.host or str(status.get("host") or DEFAULT_OLLAMA_HOST)
+    models = list_ollama_models(host)
+    selected = status.get("model") or select_preferred_model(models)
+    print(
+        json.dumps(
+            {"provider": "ollama", "models": models, "selected": selected, "llm": status},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0

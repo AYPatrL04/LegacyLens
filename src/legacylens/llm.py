@@ -1,12 +1,15 @@
 ﻿from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
-from typing import Any, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator, Protocol
 
 from .models import AnalysisRequest, Fact, Finding, ProjectContext
 
@@ -19,6 +22,9 @@ DEFAULT_MODEL_PREFERENCES = (
     "mistral",
 )
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+DEFAULT_API_PATH = "/chat/completions"
+CONFIG_FILENAMES = (".legacylens.local.json", ".legacylens.json")
+LOGGER = logging.getLogger("legacylens.llm")
 
 
 @dataclass(frozen=True)
@@ -28,10 +34,44 @@ class Explanation:
     fallback_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class LlmConfig:
+    mode: str = "local"
+    config_path: str | None = None
+    timeout_seconds: float = 60.0
+    model: str | None = None
+    ollama_host: str = DEFAULT_OLLAMA_HOST
+    ollama_model: str | None = None
+    ollama_prefer: tuple[str, ...] = DEFAULT_MODEL_PREFERENCES
+    ollama_disable_autodiscovery: bool = False
+    api_url: str | None = None
+    api_base_url: str | None = None
+    api_path: str = DEFAULT_API_PATH
+    api_key: str | None = None
+    api_key_env: str | None = None
+    api_key_header: str = "Authorization"
+    api_key_prefix: str = "Bearer "
+    api_model: str | None = None
+    api_headers: dict[str, str] = field(default_factory=dict)
+
+
+class LlmClient(Protocol):
+    provider: str
+    model: str | None
+    host: str
+
+    def generate(self, prompt: str) -> str:
+        ...
+
+    def generate_stream(self, prompt: str) -> Iterator[str]:
+        ...
+
+
 class Explainer:
-    def __init__(self, client: "OllamaClient | None" = None) -> None:
+    def __init__(self, client: LlmClient | None = None) -> None:
         self.client = client
         self._client_checked = client is not None
+        self._client_error: str | None = None
 
     def explain(
         self,
@@ -43,31 +83,42 @@ class Explainer:
     ) -> Explanation:
         prompt = _build_prompt(request, language, findings, facts, context)
         if not request.use_llm:
+            LOGGER.info("llm disabled; using deterministic fallback language=%s file=%s", language, request.file_name or "unknown")
             return Explanation(markdown=_render_deterministic(language, findings, facts, context, request))
 
         self._ensure_client()
 
         if self.client is not None:
+            started_at = time.monotonic()
+            _log_llm_start(self.client, stream=False, prompt=prompt, language=language, request=request)
             try:
                 markdown = self.client.generate(prompt)
                 if markdown:
+                    _log_llm_success(self.client, stream=False, started_at=started_at, output_chars=len(markdown))
                     return Explanation(
                         markdown=_append_line_reference_warning(markdown, request, findings, context),
                         model_used=self.client.model,
                     )
+                reason = _empty_response_reason(self.client)
+                _log_llm_fallback(self.client, reason, stream=False, started_at=started_at)
                 return Explanation(
                     markdown=_render_deterministic(language, findings, facts, context, request),
-                    fallback_reason=f"Ollama model {self.client.model} returned an empty response.",
+                    fallback_reason=reason,
                 )
             except OSError as exc:
+                reason = _unavailable_reason(self.client, exc)
+                _log_llm_failure(self.client, exc, stream=False, started_at=started_at)
+                _log_llm_fallback(self.client, reason, stream=False, started_at=started_at)
                 return Explanation(
                     markdown=_render_deterministic(language, findings, facts, context, request),
-                    fallback_reason=f"Ollama unavailable: {exc}",
+                    fallback_reason=reason,
                 )
 
+        reason = self._no_client_reason()
+        LOGGER.warning("llm unavailable before call; using deterministic fallback reason=%s language=%s file=%s", reason, language, request.file_name or "unknown")
         return Explanation(
             markdown=_render_deterministic(language, findings, facts, context, request),
-            fallback_reason="Ollama model was not configured or auto-discovered.",
+            fallback_reason=reason,
         )
 
     def explain_stream(
@@ -80,6 +131,7 @@ class Explainer:
     ) -> Iterator[dict[str, Any]]:
         prompt = _build_prompt(request, language, findings, facts, context)
         if not request.use_llm:
+            LOGGER.info("llm disabled for stream; using deterministic fallback language=%s file=%s", language, request.file_name or "unknown")
             markdown = _render_deterministic(language, findings, facts, context, request)
             yield {
                 "type": "delta",
@@ -90,7 +142,8 @@ class Explainer:
 
         self._ensure_client()
         if self.client is None:
-            reason = "Ollama model was not configured or auto-discovered."
+            reason = self._no_client_reason()
+            LOGGER.warning("llm unavailable before stream; using deterministic fallback reason=%s language=%s file=%s", reason, language, request.file_name or "unknown")
             yield {"type": "fallback", "reason": reason}
             yield {
                 "type": "delta",
@@ -101,13 +154,17 @@ class Explainer:
 
         emitted = False
         chunks: list[str] = []
+        started_at = time.monotonic()
+        _log_llm_start(self.client, stream=True, prompt=prompt, language=language, request=request)
         try:
             for text in self.client.generate_stream(prompt):
                 emitted = True
                 chunks.append(text)
                 yield {"type": "delta", "text": text}
         except OSError as exc:
-            reason = f"Ollama unavailable: {exc}"
+            reason = _unavailable_reason(self.client, exc)
+            _log_llm_failure(self.client, exc, stream=True, started_at=started_at)
+            _log_llm_fallback(self.client, reason, stream=True, started_at=started_at)
             yield {"type": "fallback", "reason": reason}
             yield {
                 "type": "delta",
@@ -117,7 +174,8 @@ class Explainer:
             return
 
         if not emitted:
-            reason = f"Ollama model {self.client.model} returned an empty response."
+            reason = _empty_response_reason(self.client)
+            _log_llm_fallback(self.client, reason, stream=True, started_at=started_at)
             yield {"type": "fallback", "reason": reason}
             yield {
                 "type": "delta",
@@ -126,23 +184,59 @@ class Explainer:
             yield {"type": "done", "model_used": self.client.model, "fallback_reason": reason}
             return
 
+        _log_llm_success(self.client, stream=True, started_at=started_at, output_chars=sum(len(chunk) for chunk in chunks))
         warning = _line_reference_warning("".join(chunks), request, findings, context)
         if warning:
+            LOGGER.warning("llm line-reference warning provider=%s model=%s reason=%s", self.client.provider, _display_model(self.client.model), warning)
             yield {"type": "delta", "text": f"\n\n> 行号校验：{warning}"}
         yield {"type": "done", "model_used": self.client.model, "fallback_reason": None}
 
     def model_status(self) -> dict[str, str | bool | None]:
         self._ensure_client()
+        try:
+            config = load_llm_config()
+        except ValueError:
+            config = LlmConfig()
         return {
             "available": self.client is not None,
-            "model": self.client.model if self.client else None,
-            "host": self.client.host if self.client else normalize_ollama_host(os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)),
+            "provider": getattr(self.client, "provider", config.mode) if self.client else config.mode,
+            "mode": config.mode,
+            "model": getattr(self.client, "model", None) if self.client else _configured_model(config),
+            "host": getattr(self.client, "host", None) if self.client else _configured_host(config),
+            "config_path": config.config_path,
         }
 
     def _ensure_client(self) -> None:
         if self.client is None and not self._client_checked:
-            self.client = OllamaClient.from_environment()
+            try:
+                self.client = client_from_configuration()
+            except ValueError as exc:
+                self.client = None
+                self._client_error = str(exc)
+                LOGGER.warning("llm client configuration failed reason=%s", exc)
+            if self.client is not None:
+                LOGGER.info(
+                    "llm client configured provider=%s model=%s host=%s",
+                    self.client.provider,
+                    _display_model(self.client.model),
+                    _safe_host(self.client.host),
+                )
+            else:
+                LOGGER.warning("llm client not configured reason=%s", self._no_client_reason())
             self._client_checked = True
+
+    def _no_client_reason(self) -> str:
+        if self._client_error:
+            return self._client_error
+        try:
+            config = load_llm_config()
+        except ValueError as exc:
+            return str(exc)
+        if config.mode == "api":
+            if not _resolve_api_url(config.api_url, config.api_base_url, config.api_path):
+                return "API mode is configured but no api.url or api.baseUrl was provided."
+            return "API mode is configured but no API client could be created."
+        return "Local Ollama model was not configured or auto-discovered."
 
 
 @dataclass(frozen=True)
@@ -150,20 +244,27 @@ class OllamaClient:
     host: str
     model: str
     timeout_seconds: float = 60.0
+    provider: str = field(default="ollama", init=False)
 
     @classmethod
     def from_environment(cls) -> "OllamaClient | None":
-        host = normalize_ollama_host(os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST))
-        timeout = _float_from_environment("LEGACYLENS_OLLAMA_TIMEOUT", default=60.0)
-        model = os.environ.get("LEGACYLENS_OLLAMA_MODEL") or os.environ.get("OLLAMA_MODEL")
-        if not model and not _truthy(os.environ.get("LEGACYLENS_DISABLE_OLLAMA_AUTODISCOVERY")):
+        config = load_llm_config()
+        if config.mode != "local":
+            return None
+        return cls.from_config(config)
+
+    @classmethod
+    def from_config(cls, config: LlmConfig) -> "OllamaClient | None":
+        host = normalize_ollama_host(config.ollama_host)
+        model = config.ollama_model or config.model
+        if not model and not config.ollama_disable_autodiscovery:
             try:
-                model = discover_ollama_model(host)
+                model = discover_ollama_model(host, preferences=config.ollama_prefer)
             except OSError:
                 model = None
         if not model:
             return None
-        return cls(host=host, model=model, timeout_seconds=timeout)
+        return cls(host=host, model=model, timeout_seconds=config.timeout_seconds)
 
     @classmethod
     def discover(cls, host: str | None = None) -> "OllamaClient | None":
@@ -233,9 +334,113 @@ class OllamaClient:
             raise OSError(str(exc)) from exc
 
 
-def discover_ollama_model(host: str = DEFAULT_OLLAMA_HOST) -> str | None:
+@dataclass(frozen=True)
+class ApiClient:
+    url: str
+    api_key: str | None = None
+    model: str | None = None
+    timeout_seconds: float = 60.0
+    headers: dict[str, str] = field(default_factory=dict)
+    api_key_header: str = "Authorization"
+    api_key_prefix: str = "Bearer "
+    provider: str = field(default="api", init=False)
+
+    @property
+    def host(self) -> str:
+        return self.url
+
+    @classmethod
+    def from_config(cls, config: LlmConfig) -> "ApiClient | None":
+        url = _resolve_api_url(config.api_url, config.api_base_url, config.api_path)
+        if not url:
+            return None
+        return cls(
+            url=url,
+            api_key=config.api_key,
+            model=config.api_model or config.model,
+            timeout_seconds=config.timeout_seconds,
+            headers=config.api_headers,
+            api_key_header=config.api_key_header,
+            api_key_prefix=config.api_key_prefix,
+        )
+
+    def generate(self, prompt: str) -> str:
+        payload = self._payload(prompt, stream=False)
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise OSError(_http_error_message(exc)) from exc
+        except (urllib.error.URLError, ValueError) as exc:
+            raise OSError(str(exc)) from exc
+        raw = _extract_api_content(data).strip()
+        cleaned = _strip_thinking(raw)
+        return cleaned or raw
+
+    def generate_stream(self, prompt: str) -> Iterator[str]:
+        payload = self._payload(prompt, stream=True)
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if line == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = _extract_api_delta(data)
+                    if chunk:
+                        yield chunk
+        except urllib.error.HTTPError as exc:
+            raise OSError(_http_error_message(exc)) from exc
+        except urllib.error.URLError as exc:
+            raise OSError(str(exc)) from exc
+
+    def _payload(self, prompt: str, stream: bool) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "stream": stream,
+        }
+        if self.model:
+            payload["model"] = self.model
+        return payload
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        headers.update(self.headers)
+        if self.api_key:
+            headers[self.api_key_header] = f"{self.api_key_prefix}{self.api_key}" if self.api_key_prefix else self.api_key
+        return headers
+
+
+def client_from_configuration(config: LlmConfig | None = None) -> LlmClient | None:
+    resolved = config or load_llm_config()
+    if resolved.mode == "api":
+        return ApiClient.from_config(resolved)
+    return OllamaClient.from_config(resolved)
+
+
+def discover_ollama_model(host: str = DEFAULT_OLLAMA_HOST, preferences: tuple[str, ...] | None = None) -> str | None:
     models = list_ollama_models(host=host)
-    return select_preferred_model(models)
+    return select_preferred_model(models, preferences=preferences)
 
 
 def list_ollama_models(host: str = DEFAULT_OLLAMA_HOST, timeout_seconds: float = 2.0) -> list[str]:
@@ -257,14 +462,13 @@ def list_ollama_models(host: str = DEFAULT_OLLAMA_HOST, timeout_seconds: float =
     return names
 
 
-def select_preferred_model(models: list[str]) -> str | None:
+def select_preferred_model(models: list[str], preferences: tuple[str, ...] | None = None) -> str | None:
     if not models:
         return None
-    preferred = [
-        item.strip().lower()
-        for item in os.environ.get("LEGACYLENS_OLLAMA_PREFER", ",".join(DEFAULT_MODEL_PREFERENCES)).split(",")
-        if item.strip()
-    ]
+    preferred = [item.strip().lower() for item in (preferences or _preference_list(
+        os.environ.get("LEGACYLENS_OLLAMA_PREFER"),
+        default=DEFAULT_MODEL_PREFERENCES,
+    )) if item.strip()]
     lower_models = [(model.lower(), model) for model in models]
     for prefix in preferred:
         for lower, original in lower_models:
@@ -280,6 +484,254 @@ def normalize_ollama_host(host: str | None) -> str:
     if "://" not in cleaned:
         return f"http://{cleaned}"
     return cleaned
+
+
+def load_llm_config() -> LlmConfig:
+    payload, config_path = _load_config_payload()
+    llm = _mapping(payload.get("llm")) or payload
+    local = _mapping(llm.get("local")) or _mapping(llm.get("ollama")) or {}
+    api = _mapping(llm.get("api")) or {}
+
+    mode = _normalize_mode(_first_string(os.environ.get("LEGACYLENS_LLM_MODE"), llm.get("mode"), llm.get("provider")))
+    timeout = _float_value(
+        os.environ.get("LEGACYLENS_LLM_TIMEOUT"),
+        os.environ.get("LEGACYLENS_OLLAMA_TIMEOUT"),
+        os.environ.get("LEGACYLENS_API_TIMEOUT"),
+        llm.get("timeoutSeconds"),
+        llm.get("timeout_seconds"),
+        default=60.0,
+    )
+    model = _first_string(os.environ.get("LEGACYLENS_MODEL"), llm.get("model"))
+    api_key_env = _first_string(os.environ.get("LEGACYLENS_API_KEY_ENV"), api.get("apiKeyEnv"), api.get("keyEnv"))
+    api_key = _first_string(
+        os.environ.get("LEGACYLENS_API_KEY"),
+        os.environ.get(api_key_env) if api_key_env else None,
+        api.get("apiKey"),
+        api.get("key"),
+    )
+
+    return LlmConfig(
+        mode=mode,
+        config_path=str(config_path) if config_path else None,
+        timeout_seconds=timeout,
+        model=model,
+        ollama_host=normalize_ollama_host(_first_string(os.environ.get("OLLAMA_HOST"), local.get("host"), llm.get("ollamaHost"), DEFAULT_OLLAMA_HOST)),
+        ollama_model=_first_string(os.environ.get("LEGACYLENS_OLLAMA_MODEL"), os.environ.get("OLLAMA_MODEL"), local.get("model"), model if mode == "local" else None),
+        ollama_prefer=_preference_list(
+            os.environ.get("LEGACYLENS_OLLAMA_PREFER"),
+            local.get("prefer"),
+            local.get("preferences"),
+            default=DEFAULT_MODEL_PREFERENCES,
+        ),
+        ollama_disable_autodiscovery=_bool_value(
+            os.environ.get("LEGACYLENS_DISABLE_OLLAMA_AUTODISCOVERY"),
+            local.get("disableAutodiscovery"),
+            local.get("disable_autodiscovery"),
+            default=False,
+        ),
+        api_url=_first_string(os.environ.get("LEGACYLENS_API_URL"), api.get("url")),
+        api_base_url=_first_string(os.environ.get("LEGACYLENS_API_BASE_URL"), api.get("baseUrl"), api.get("base_url")),
+        api_path=_first_string(os.environ.get("LEGACYLENS_API_PATH"), api.get("path"), api.get("endpoint"), DEFAULT_API_PATH) or DEFAULT_API_PATH,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        api_key_header=_first_string(os.environ.get("LEGACYLENS_API_KEY_HEADER"), api.get("apiKeyHeader"), api.get("keyHeader"), "Authorization") or "Authorization",
+        api_key_prefix=_first_raw_string(os.environ.get("LEGACYLENS_API_KEY_PREFIX"), api.get("apiKeyPrefix"), api.get("keyPrefix"), "Bearer "),
+        api_model=_first_string(os.environ.get("LEGACYLENS_API_MODEL"), api.get("model"), model if mode == "api" else None),
+        api_headers=_string_mapping(api.get("headers")),
+    )
+
+
+def find_config_path(start: Path | None = None) -> Path | None:
+    explicit = os.environ.get("LEGACYLENS_CONFIG")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+
+    current = (start or Path.cwd()).resolve()
+    for directory in (current, *current.parents):
+        for filename in CONFIG_FILENAMES:
+            candidate = directory / filename
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def _load_config_payload() -> tuple[dict[str, Any], Path | None]:
+    path = find_config_path()
+    if path is None:
+        return {}, None
+    if not path.exists():
+        raise ValueError(f"Legacy Lens config file does not exist: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Legacy Lens config file is invalid JSON: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Legacy Lens config file must contain a JSON object: {path}")
+    return payload, path
+
+
+def _resolve_api_url(api_url: str | None, api_base_url: str | None, api_path: str | None) -> str | None:
+    if api_url:
+        return api_url.strip()
+    if not api_base_url:
+        return None
+    base = api_base_url.strip().rstrip("/")
+    path = (api_path or DEFAULT_API_PATH).strip()
+    if path.startswith(("http://", "https://")):
+        return path
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return f"{base}{path}"
+
+
+def _configured_host(config: LlmConfig) -> str | None:
+    if config.mode == "api":
+        return _resolve_api_url(config.api_url, config.api_base_url, config.api_path)
+    return config.ollama_host
+
+
+def _configured_model(config: LlmConfig) -> str | None:
+    if config.mode == "api":
+        return config.api_model or config.model
+    return config.ollama_model or config.model
+
+
+def _extract_api_content(data: dict[str, Any]) -> str:
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                content = _content_to_text(message.get("content"))
+                if content:
+                    return content
+            text = _content_to_text(choice.get("text"))
+            if text:
+                return text
+    for key in ("response", "content", "text", "output"):
+        text = _content_to_text(data.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _extract_api_delta(data: dict[str, Any]) -> str:
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                content = _content_to_text(delta.get("content"))
+                if content:
+                    return content
+            text = _content_to_text(choice.get("text"))
+            if text:
+                return text
+    for key in ("response", "content", "text", "output"):
+        text = _content_to_text(data.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _content_to_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _http_error_message(exc: urllib.error.HTTPError) -> str:
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        body = ""
+    if body:
+        return f"HTTP {exc.code}: {body[:500]}"
+    return f"HTTP {exc.code}: {exc.reason}"
+
+
+def _empty_response_reason(client: LlmClient) -> str:
+    model = f" model {client.model}" if client.model else ""
+    return f"{client.provider}{model} returned an empty response."
+
+
+def _unavailable_reason(client: LlmClient, exc: OSError) -> str:
+    return f"{client.provider} unavailable: {exc}"
+
+
+def _log_llm_start(client: LlmClient, stream: bool, prompt: str, language: str, request: AnalysisRequest) -> None:
+    LOGGER.info(
+        "llm call start provider=%s model=%s host=%s stream=%s prompt_chars=%d language=%s file=%s cursor_line=%s",
+        client.provider,
+        _display_model(client.model),
+        _safe_host(client.host),
+        stream,
+        len(prompt),
+        language,
+        request.file_name or "unknown",
+        request.cursor_line or "unknown",
+    )
+
+
+def _log_llm_success(client: LlmClient, stream: bool, started_at: float, output_chars: int) -> None:
+    LOGGER.info(
+        "llm call success provider=%s model=%s stream=%s output_chars=%d elapsed_ms=%d",
+        client.provider,
+        _display_model(client.model),
+        stream,
+        output_chars,
+        _elapsed_ms(started_at),
+    )
+
+
+def _log_llm_failure(client: LlmClient, exc: OSError, stream: bool, started_at: float) -> None:
+    LOGGER.warning(
+        "llm call failed provider=%s model=%s stream=%s elapsed_ms=%d error_type=%s error=%s",
+        client.provider,
+        _display_model(client.model),
+        stream,
+        _elapsed_ms(started_at),
+        type(exc).__name__,
+        exc,
+    )
+
+
+def _log_llm_fallback(client: LlmClient, reason: str, stream: bool, started_at: float) -> None:
+    LOGGER.warning(
+        "llm fallback provider=%s model=%s stream=%s elapsed_ms=%d reason=%s",
+        client.provider,
+        _display_model(client.model),
+        stream,
+        _elapsed_ms(started_at),
+        reason,
+    )
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
+
+
+def _display_model(model: str | None) -> str:
+    return model or "<unspecified>"
+
+
+def _safe_host(host: str) -> str:
+    # Hosts can contain path information, but should never include API keys.
+    return re.sub(r"([?&](?:api[_-]?key|key|token)=)[^&]+", r"\1<redacted>", host, flags=re.IGNORECASE)
 
 
 def _build_prompt(
@@ -305,7 +757,7 @@ def _build_prompt(
         "Line number rules are strict:\n"
         "- The numbered code excerpt below uses REAL file line numbers, not relative snippet lines.\n"
         "- Only cite a line number if it appears in Allowed evidence line numbers and the visible line text directly supports the claim.\n"
-        "- Never invent a line number. If no exact line supports a claim, say '鍦ㄨ繖娈典唬鐮侀檮杩? instead of giving a line number.\n"
+        "- Never invent a line number. If no exact line supports a claim, say '在这段代码附近' instead of giving a line number.\n"
         "- Prefer quoting the exact identifier or expression over adding extra line numbers.\n\n"
         "Your answer must focus on these points in this order:\n"
         "1. What this hovered code does at runtime, using concrete variable names and control flow.\n"
@@ -437,6 +889,82 @@ def _extract_line_references(markdown: str) -> set[int]:
             except ValueError:
                 continue
     return references
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _string_mapping(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): str(item) for key, item in value.items() if item is not None}
+
+
+def _first_string(*values: Any) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _first_raw_string(*values: Any) -> str:
+    for value in values:
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def _normalize_mode(value: str | None) -> str:
+    normalized = (value or "local").strip().lower().replace("_", "-")
+    if normalized in {"api", "remote", "http", "https", "openai", "openai-compatible", "chat-completions"}:
+        return "api"
+    return "local"
+
+
+def _preference_list(*values: Any, default: tuple[str, ...]) -> tuple[str, ...]:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            items = tuple(item.strip() for item in value.split(",") if item.strip())
+            if items:
+                return items
+        if isinstance(value, list):
+            items = tuple(str(item).strip() for item in value if str(item).strip())
+            if items:
+                return items
+    return default
+
+
+def _bool_value(*values: Any, default: bool) -> bool:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return bool(value)
+    return default
+
+
+def _float_value(*values: Any, default: float) -> float:
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
 
 
 def _truthy(value: str | None) -> bool:
