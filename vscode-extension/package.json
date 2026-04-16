@@ -1,0 +1,644 @@
+{
+  "name": "legacy-lens",
+  "displayName": "Legacy Lens",
+  "description": "Hover explanations for legacy code idioms with historical context.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:asm",
+    "onLanguage:batch",
+    "onLanguage:c",
+    "onLanguage:clojure",
+    "onLanguage:cobol",
+    "onLanguage:cpp",
+    "onLanguage:csharp",
+    "onLanguage:css",
+    "onLanguage:dart",
+    "onLanguage:dockerfile",
+    "onLanguage:elixir",
+    "onLanguage:erlang",
+    "onLanguage:fortran",
+    "onLanguage:fsharp",
+    "onLanguage:go",
+    "onLanguage:groovy",
+    "onLanguage:haskell",
+    "onLanguage:html",
+    "onLanguage:java",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:json",
+    "onLanguage:jsonc",
+    "onLanguage:julia",
+    "onLanguage:kotlin",
+    "onLanguage:less",
+    "onLanguage:lua",
+    "onLanguage:markdown",
+    "onLanguage:objective-c",
+    "onLanguage:objective-cpp",
+    "onLanguage:perl",
+    "onLanguage:php",
+    "onLanguage:powershell",
+    "onLanguage:python",
+    "onLanguage:r",
+    "onLanguage:ruby",
+    "onLanguage:rust",
+    "onLanguage:sass",
+    "onLanguage:scala",
+    "onLanguage:scss",
+    "onLanguage:shellscript",
+    "onLanguage:sql",
+    "onLanguage:svelte",
+    "onLanguage:swift",
+    "onLanguage:toml",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:vb",
+    "onLanguage:vue",
+    "onLanguage:xml",
+    "onLanguage:yaml",
+    "onCommand:legacyLens.analyzeSelection",
+    "onCommand:legacyLens.startBackend",
+    "onCommand:legacyLens.stopBackend",
+    "onCommand:legacyLens.showModels"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "python",
+        "aliases": [
+          "Python"
+        ],
+        "extensions": [
+          ".py",
+          ".pyi",
+          ".pyw"
+        ]
+      },
+      {
+        "id": "java",
+        "aliases": [
+          "Java"
+        ],
+        "extensions": [
+          ".java"
+        ]
+      },
+      {
+        "id": "go",
+        "aliases": [
+          "Go"
+        ],
+        "extensions": [
+          ".go"
+        ]
+      },
+      {
+        "id": "csharp",
+        "aliases": [
+          "C#",
+          "CSharp"
+        ],
+        "extensions": [
+          ".cs"
+        ]
+      },
+      {
+        "id": "rust",
+        "aliases": [
+          "Rust"
+        ],
+        "extensions": [
+          ".rs"
+        ]
+      },
+      {
+        "id": "r",
+        "aliases": [
+          "R"
+        ],
+        "extensions": [
+          ".r",
+          ".R"
+        ]
+      },
+      {
+        "id": "javascript",
+        "aliases": [
+          "JavaScript"
+        ],
+        "extensions": [
+          ".js",
+          ".mjs",
+          ".cjs"
+        ]
+      },
+      {
+        "id": "javascriptreact",
+        "aliases": [
+          "JavaScript React"
+        ],
+        "extensions": [
+          ".jsx"
+        ]
+      },
+      {
+        "id": "typescript",
+        "aliases": [
+          "TypeScript"
+        ],
+        "extensions": [
+          ".ts"
+        ]
+      },
+      {
+        "id": "typescriptreact",
+        "aliases": [
+          "TypeScript React"
+        ],
+        "extensions": [
+          ".tsx"
+        ]
+      },
+      {
+        "id": "php",
+        "aliases": [
+          "PHP"
+        ],
+        "extensions": [
+          ".php"
+        ]
+      },
+      {
+        "id": "ruby",
+        "aliases": [
+          "Ruby"
+        ],
+        "extensions": [
+          ".rb"
+        ]
+      },
+      {
+        "id": "kotlin",
+        "aliases": [
+          "Kotlin"
+        ],
+        "extensions": [
+          ".kt",
+          ".kts"
+        ]
+      },
+      {
+        "id": "swift",
+        "aliases": [
+          "Swift"
+        ],
+        "extensions": [
+          ".swift"
+        ]
+      },
+      {
+        "id": "scala",
+        "aliases": [
+          "Scala"
+        ],
+        "extensions": [
+          ".scala",
+          ".sc"
+        ]
+      },
+      {
+        "id": "sql",
+        "aliases": [
+          "SQL"
+        ],
+        "extensions": [
+          ".sql"
+        ]
+      },
+      {
+        "id": "shellscript",
+        "aliases": [
+          "Shell Script"
+        ],
+        "extensions": [
+          ".sh",
+          ".bash",
+          ".zsh",
+          ".ksh",
+          ".fish"
+        ]
+      },
+      {
+        "id": "batch",
+        "aliases": [
+          "Batch"
+        ],
+        "extensions": [
+          ".bat",
+          ".cmd"
+        ]
+      },
+      {
+        "id": "powershell",
+        "aliases": [
+          "PowerShell"
+        ],
+        "extensions": [
+          ".ps1",
+          ".psm1",
+          ".psd1"
+        ]
+      },
+      {
+        "id": "dart",
+        "aliases": [
+          "Dart"
+        ],
+        "extensions": [
+          ".dart"
+        ]
+      },
+      {
+        "id": "lua",
+        "aliases": [
+          "Lua"
+        ],
+        "extensions": [
+          ".lua"
+        ]
+      },
+      {
+        "id": "perl",
+        "aliases": [
+          "Perl"
+        ],
+        "extensions": [
+          ".pl",
+          ".pm"
+        ]
+      },
+      {
+        "id": "haskell",
+        "aliases": [
+          "Haskell"
+        ],
+        "extensions": [
+          ".hs",
+          ".lhs"
+        ]
+      },
+      {
+        "id": "elixir",
+        "aliases": [
+          "Elixir"
+        ],
+        "extensions": [
+          ".ex",
+          ".exs"
+        ]
+      },
+      {
+        "id": "erlang",
+        "aliases": [
+          "Erlang"
+        ],
+        "extensions": [
+          ".erl",
+          ".hrl"
+        ]
+      },
+      {
+        "id": "clojure",
+        "aliases": [
+          "Clojure"
+        ],
+        "extensions": [
+          ".clj",
+          ".cljs",
+          ".cljc"
+        ]
+      },
+      {
+        "id": "groovy",
+        "aliases": [
+          "Groovy"
+        ],
+        "extensions": [
+          ".groovy"
+        ]
+      },
+      {
+        "id": "fsharp",
+        "aliases": [
+          "F#",
+          "FSharp"
+        ],
+        "extensions": [
+          ".fs",
+          ".fsx",
+          ".fsi"
+        ]
+      },
+      {
+        "id": "vb",
+        "aliases": [
+          "Visual Basic"
+        ],
+        "extensions": [
+          ".vb"
+        ]
+      },
+      {
+        "id": "julia",
+        "aliases": [
+          "Julia"
+        ],
+        "extensions": [
+          ".jl"
+        ]
+      },
+      {
+        "id": "objective-c",
+        "aliases": [
+          "Objective-C"
+        ],
+        "extensions": [
+          ".m"
+        ]
+      },
+      {
+        "id": "objective-cpp",
+        "aliases": [
+          "Objective-C++"
+        ],
+        "extensions": [
+          ".mm"
+        ]
+      },
+      {
+        "id": "html",
+        "aliases": [
+          "HTML"
+        ],
+        "extensions": [
+          ".html",
+          ".htm"
+        ]
+      },
+      {
+        "id": "css",
+        "aliases": [
+          "CSS"
+        ],
+        "extensions": [
+          ".css"
+        ]
+      },
+      {
+        "id": "scss",
+        "aliases": [
+          "SCSS"
+        ],
+        "extensions": [
+          ".scss"
+        ]
+      },
+      {
+        "id": "sass",
+        "aliases": [
+          "Sass"
+        ],
+        "extensions": [
+          ".sass"
+        ]
+      },
+      {
+        "id": "less",
+        "aliases": [
+          "Less"
+        ],
+        "extensions": [
+          ".less"
+        ]
+      },
+      {
+        "id": "vue",
+        "aliases": [
+          "Vue"
+        ],
+        "extensions": [
+          ".vue"
+        ]
+      },
+      {
+        "id": "svelte",
+        "aliases": [
+          "Svelte"
+        ],
+        "extensions": [
+          ".svelte"
+        ]
+      },
+      {
+        "id": "json",
+        "aliases": [
+          "JSON"
+        ],
+        "extensions": [
+          ".json"
+        ]
+      },
+      {
+        "id": "jsonc",
+        "aliases": [
+          "JSONC"
+        ],
+        "extensions": [
+          ".jsonc"
+        ]
+      },
+      {
+        "id": "yaml",
+        "aliases": [
+          "YAML"
+        ],
+        "extensions": [
+          ".yaml",
+          ".yml"
+        ]
+      },
+      {
+        "id": "toml",
+        "aliases": [
+          "TOML"
+        ],
+        "extensions": [
+          ".toml"
+        ]
+      },
+      {
+        "id": "xml",
+        "aliases": [
+          "XML"
+        ],
+        "extensions": [
+          ".xml"
+        ]
+      },
+      {
+        "id": "markdown",
+        "aliases": [
+          "Markdown"
+        ],
+        "extensions": [
+          ".md",
+          ".markdown"
+        ]
+      },
+      {
+        "id": "dockerfile",
+        "aliases": [
+          "Dockerfile"
+        ],
+        "filenames": [
+          "Dockerfile"
+        ]
+      },
+      {
+        "id": "fortran",
+        "aliases": [
+          "Fortran",
+          "Fortran 77"
+        ],
+        "extensions": [
+          ".f",
+          ".f77",
+          ".for",
+          ".ftn"
+        ]
+      },
+      {
+        "id": "cobol",
+        "aliases": [
+          "COBOL"
+        ],
+        "extensions": [
+          ".cob",
+          ".cbl",
+          ".cpy"
+        ]
+      },
+      {
+        "id": "asm",
+        "aliases": [
+          "Assembly"
+        ],
+        "extensions": [
+          ".asm",
+          ".s"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "legacyLens.analyzeSelection",
+        "title": "Legacy Lens: Analyze Selection"
+      },
+      {
+        "command": "legacyLens.startBackend",
+        "title": "Legacy Lens: Start Backend"
+      },
+      {
+        "command": "legacyLens.stopBackend",
+        "title": "Legacy Lens: Stop Backend"
+      },
+      {
+        "command": "legacyLens.showModels",
+        "title": "Legacy Lens: Show Ollama Models"
+      }
+    ],
+    "configuration": {
+      "title": "Legacy Lens",
+      "properties": {
+        "legacyLens.backendUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8765",
+          "description": "Local Legacy Lens backend URL."
+        },
+        "legacyLens.maxContextLines": {
+          "type": "number",
+          "default": 80,
+          "description": "Maximum number of lines to send around the cursor."
+        },
+        "legacyLens.useLlm": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask the backend to use Ollama when configured."
+        },
+        "legacyLens.hoverUseLlm": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use Ollama directly inside hover."
+        },
+        "legacyLens.contextScope": {
+          "type": "string",
+          "enum": [
+            "none",
+            "directory",
+            "project"
+          ],
+          "default": "directory",
+          "description": "Context sent with hover requests. Use directory for focused explanations, project for broader role analysis."
+        },
+        "legacyLens.autoStartBackend": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the local Python backend when needed."
+        },
+        "legacyLens.backendCommand": {
+          "type": "string",
+          "default": "python",
+          "description": "Command used to start the Legacy Lens backend."
+        },
+        "legacyLens.backendArgs": {
+          "type": "array",
+          "default": [
+            "-m",
+            "legacylens",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8765"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Arguments passed to the backend command."
+        },
+        "legacyLens.backendCwd": {
+          "type": "string",
+          "default": "",
+          "description": "Working directory used to start the backend. Empty means the first workspace folder."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.92.0",
+    "typescript": "^5.5.0"
+  }
+}
