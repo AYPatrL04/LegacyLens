@@ -589,6 +589,11 @@
           "default": true,
           "description": "Use Ollama directly inside hover."
         },
+        "legacyLens.outputLanguage": {
+          "type": "string",
+          "default": "auto",
+          "description": "VS Code-side analysis output language. Project config outputLanguage has priority; this setting is used when project config is auto or absent."
+        },
         "legacyLens.contextScope": {
           "type": "string",
           "enum": [

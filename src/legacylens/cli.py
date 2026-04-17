@@ -3,10 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 from pathlib import Path
 
+from .config import logging_level
 from .engine import LegacyLensEngine
 from .llm import DEFAULT_OLLAMA_HOST, Explainer, list_ollama_models, select_preferred_model
 from .models import AnalysisRequest
@@ -21,6 +21,10 @@ def main(argv: list[str] | None = None) -> int:
     analyze_parser = subparsers.add_parser("analyze", help="Analyze a file or stdin.")
     analyze_parser.add_argument("path", help="Source path, or '-' for stdin.")
     analyze_parser.add_argument("--language", help="Override language detection.")
+    analyze_parser.add_argument(
+        "--output-language",
+        help="Explanation language or locale, such as en, zh-CN, or ja-JP. Defaults to config outputLanguage or the system locale.",
+    )
     analyze_parser.add_argument("--cursor-line", type=int, help="Rank findings near this one-based line.")
     analyze_parser.add_argument("--max-findings", type=int, default=8)
     analyze_parser.add_argument("--use-llm", action="store_true", help="Use the configured LLM provider.")
@@ -64,6 +68,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
     request = AnalysisRequest(
         code=code,
         language=args.language,
+        output_language=args.output_language,
         file_name=file_name,
         project_root=args.project_root,
         cursor_line=args.cursor_line,
@@ -80,7 +85,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
 
 
 def _configure_logging() -> None:
-    level_name = os.environ.get("LEGACYLENS_LOG_LEVEL", "INFO").strip().upper()
+    level_name = logging_level()
     level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 

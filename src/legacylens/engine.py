@@ -12,6 +12,7 @@ from .analyzers import (
 )
 from .context import build_project_context
 from .facts import FactStore
+from .i18n import resolve_output_language
 from .language import detect_language
 from .llm import Explainer
 from .models import AnalysisRequest, AnalysisResponse, Finding, Severity
@@ -32,6 +33,7 @@ class LegacyLensEngine:
         context = build_project_context(request, language)
         return AnalysisResponse(
             language=language,
+            output_language=resolve_output_language(request.output_language, request.ui_language).code,
             findings=findings,
             facts=facts,
             context=context,
@@ -48,6 +50,7 @@ class LegacyLensEngine:
         )
         return AnalysisResponse(
             language=inspected.language,
+            output_language=inspected.output_language,
             findings=inspected.findings,
             facts=inspected.facts,
             context=inspected.context,

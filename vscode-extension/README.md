@@ -49,6 +49,7 @@ python -m legacylens serve --host 127.0.0.1 --port 8765
 - `legacyLens.maxContextLines`: hover 请求携带的代码窗口大小，默认 `80`。
 - `legacyLens.useLlm`: `Analyze Selection` 和普通分析是否请求后端配置的 LLM provider，默认 `true`。
 - `legacyLens.hoverUseLlm`: hover 是否直接等待 LLM 完整结果，默认 `true`。
+- `legacyLens.outputLanguage`: VS Code 侧输出语言设置，默认 `auto`。项目配置文件里的 `outputLanguage` 优先；配置为 `auto` 或缺失时，才使用该设置和 VS Code 界面语言。
 - `legacyLens.contextScope`: 上下文范围，可选 `none`、`directory`、`project`，默认 `directory`。
 - `legacyLens.autoStartBackend`: 后端不可用时是否自动启动，默认 `true`。
 - `legacyLens.backendCommand`: 后端启动命令，默认 `python`。
@@ -60,16 +61,17 @@ python -m legacylens serve --host 127.0.0.1 --port 8765
 扩展不直接保存 API key。LLM provider 由 Python 后端配置：
 
 - 不提供配置文件时，后端继续使用本地 Ollama。
-- 如果工作区根目录或上级目录存在 `.legacylens.local.json` 或 `.legacylens.json`，后端会读取其中的 `llm` 配置。
+- 如果工作区根目录或上级目录存在 `.legacylens.local.json` 或 `.legacylens.json`，后端会读取其中的输出语言、日志和 `llm` 配置。
 - 也可以通过 `LEGACYLENS_CONFIG` 指定配置文件路径。
 - `llm.mode=api` 时，后端使用配置的 OpenAI-compatible Chat Completions API。
 - `model` 是可选字段；本地模式省略时自动发现 Ollama 模型，API 模式省略时请求体不发送 `model`。
+- 输出语言不改变 provider 配置。优先级是项目配置文件 `outputLanguage`、VS Code locale、系统语言；后端让模型直接用目标语言回答，如果模型不支持该语言，则要求回退到英语，而不是再发起一次翻译调用。
 
 ## Logging
 
 扩展自动启动后端时，后端日志会进入 `Legacy Lens` Output Channel。日志包括 provider、model、host、调用成功/失败、fallback 原因和耗时。
 
-后端不会把代码正文、prompt 正文或 API key 写入日志。可以通过 `LEGACYLENS_LOG_LEVEL` 调整日志级别。
+后端不会把代码正文、prompt 正文或 API key 写入日志。可以通过配置文件中的 `logging.level` 调整日志级别。
 
 ## Privacy
 

@@ -60,6 +60,8 @@ class Fact:
 class AnalysisRequest:
     code: str
     language: str | None = None
+    output_language: str | None = None
+    ui_language: str | None = None
     file_name: str | None = None
     project_root: str | None = None
     excerpt_start_line: int = 1
@@ -73,6 +75,8 @@ class AnalysisRequest:
         return cls(
             code=str(payload.get("code", "")),
             language=payload.get("language"),
+            output_language=_first_present(payload, "output_language", "outputLanguage", "locale"),
+            ui_language=_first_present(payload, "ui_language", "uiLanguage", "editor_language", "editorLanguage", "display_language", "displayLanguage"),
             file_name=_first_present(payload, "file_name", "fileName"),
             project_root=_first_present(payload, "project_root", "projectRoot"),
             excerpt_start_line=max(1, _optional_int(_first_present(payload, "excerpt_start_line", "excerptStartLine")) or 1),
@@ -120,6 +124,7 @@ class AnalysisResponse:
     markdown: str = ""
     model_used: str | None = None
     fallback_reason: str | None = None
+    output_language: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +135,7 @@ class AnalysisResponse:
             "markdown": self.markdown,
             "model_used": self.model_used,
             "fallback_reason": self.fallback_reason,
+            "output_language": self.output_language,
         }
 
 

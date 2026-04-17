@@ -8,9 +8,10 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Iterator, Protocol
 
+from .config import find_config_path, load_config_payload
+from .i18n import ENGLISH, OutputLanguage, resolve_output_language
 from .models import AnalysisRequest, Fact, Finding, ProjectContext
 
 DEFAULT_MODEL_PREFERENCES = (
@@ -23,7 +24,6 @@ DEFAULT_MODEL_PREFERENCES = (
 )
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_API_PATH = "/chat/completions"
-CONFIG_FILENAMES = (".legacylens.local.json", ".legacylens.json")
 LOGGER = logging.getLogger("legacylens.llm")
 
 
@@ -81,28 +81,29 @@ class Explainer:
         facts: list[Fact],
         context: ProjectContext | None = None,
     ) -> Explanation:
-        prompt = _build_prompt(request, language, findings, facts, context)
+        output_language = resolve_output_language(request.output_language, request.ui_language)
+        prompt = _build_prompt(request, language, findings, facts, context, output_language)
         if not request.use_llm:
             LOGGER.info("llm disabled; using deterministic fallback language=%s file=%s", language, request.file_name or "unknown")
-            return Explanation(markdown=_render_deterministic(language, findings, facts, context, request))
+            return Explanation(markdown=_render_deterministic(language, findings, facts, context, request, output_language))
 
         self._ensure_client()
 
         if self.client is not None:
             started_at = time.monotonic()
-            _log_llm_start(self.client, stream=False, prompt=prompt, language=language, request=request)
+            _log_llm_start(self.client, stream=False, prompt=prompt, language=language, request=request, output_language=output_language)
             try:
                 markdown = self.client.generate(prompt)
                 if markdown:
                     _log_llm_success(self.client, stream=False, started_at=started_at, output_chars=len(markdown))
                     return Explanation(
-                        markdown=_append_line_reference_warning(markdown, request, findings, context),
+                        markdown=_append_line_reference_warning(markdown, request, findings, context, output_language),
                         model_used=self.client.model,
                     )
                 reason = _empty_response_reason(self.client)
                 _log_llm_fallback(self.client, reason, stream=False, started_at=started_at)
                 return Explanation(
-                    markdown=_render_deterministic(language, findings, facts, context, request),
+                    markdown=_render_deterministic(language, findings, facts, context, request, output_language),
                     fallback_reason=reason,
                 )
             except OSError as exc:
@@ -110,14 +111,14 @@ class Explainer:
                 _log_llm_failure(self.client, exc, stream=False, started_at=started_at)
                 _log_llm_fallback(self.client, reason, stream=False, started_at=started_at)
                 return Explanation(
-                    markdown=_render_deterministic(language, findings, facts, context, request),
+                    markdown=_render_deterministic(language, findings, facts, context, request, output_language),
                     fallback_reason=reason,
                 )
 
         reason = self._no_client_reason()
         LOGGER.warning("llm unavailable before call; using deterministic fallback reason=%s language=%s file=%s", reason, language, request.file_name or "unknown")
         return Explanation(
-            markdown=_render_deterministic(language, findings, facts, context, request),
+            markdown=_render_deterministic(language, findings, facts, context, request, output_language),
             fallback_reason=reason,
         )
 
@@ -129,10 +130,11 @@ class Explainer:
         facts: list[Fact],
         context: ProjectContext | None = None,
     ) -> Iterator[dict[str, Any]]:
-        prompt = _build_prompt(request, language, findings, facts, context)
+        output_language = resolve_output_language(request.output_language, request.ui_language)
+        prompt = _build_prompt(request, language, findings, facts, context, output_language)
         if not request.use_llm:
             LOGGER.info("llm disabled for stream; using deterministic fallback language=%s file=%s", language, request.file_name or "unknown")
-            markdown = _render_deterministic(language, findings, facts, context, request)
+            markdown = _render_deterministic(language, findings, facts, context, request, output_language)
             yield {
                 "type": "delta",
                 "text": markdown,
@@ -147,7 +149,7 @@ class Explainer:
             yield {"type": "fallback", "reason": reason}
             yield {
                 "type": "delta",
-                "text": _render_deterministic(language, findings, facts, context, request),
+                "text": _render_deterministic(language, findings, facts, context, request, output_language),
             }
             yield {"type": "done", "model_used": None, "fallback_reason": reason}
             return
@@ -155,7 +157,7 @@ class Explainer:
         emitted = False
         chunks: list[str] = []
         started_at = time.monotonic()
-        _log_llm_start(self.client, stream=True, prompt=prompt, language=language, request=request)
+        _log_llm_start(self.client, stream=True, prompt=prompt, language=language, request=request, output_language=output_language)
         try:
             for text in self.client.generate_stream(prompt):
                 emitted = True
@@ -168,7 +170,7 @@ class Explainer:
             yield {"type": "fallback", "reason": reason}
             yield {
                 "type": "delta",
-                "text": _render_deterministic(language, findings, facts, context, request),
+                "text": _render_deterministic(language, findings, facts, context, request, output_language),
             }
             yield {"type": "done", "model_used": self.client.model, "fallback_reason": reason}
             return
@@ -179,16 +181,16 @@ class Explainer:
             yield {"type": "fallback", "reason": reason}
             yield {
                 "type": "delta",
-                "text": _render_deterministic(language, findings, facts, context, request),
+                "text": _render_deterministic(language, findings, facts, context, request, output_language),
             }
             yield {"type": "done", "model_used": self.client.model, "fallback_reason": reason}
             return
 
         _log_llm_success(self.client, stream=True, started_at=started_at, output_chars=sum(len(chunk) for chunk in chunks))
-        warning = _line_reference_warning("".join(chunks), request, findings, context)
+        warning = _line_reference_warning("".join(chunks), request, findings, context, output_language)
         if warning:
             LOGGER.warning("llm line-reference warning provider=%s model=%s reason=%s", self.client.provider, _display_model(self.client.model), warning)
-            yield {"type": "delta", "text": f"\n\n> 行号校验：{warning}"}
+            yield {"type": "delta", "text": f"\n\n> {_line_warning_label(output_language)}: {warning}"}
         yield {"type": "done", "model_used": self.client.model, "fallback_reason": None}
 
     def model_status(self) -> dict[str, str | bool | None]:
@@ -487,7 +489,7 @@ def normalize_ollama_host(host: str | None) -> str:
 
 
 def load_llm_config() -> LlmConfig:
-    payload, config_path = _load_config_payload()
+    payload, config_path = load_config_payload()
     llm = _mapping(payload.get("llm")) or payload
     local = _mapping(llm.get("local")) or _mapping(llm.get("ollama")) or {}
     api = _mapping(llm.get("api")) or {}
@@ -539,36 +541,6 @@ def load_llm_config() -> LlmConfig:
         api_model=_first_string(os.environ.get("LEGACYLENS_API_MODEL"), api.get("model"), model if mode == "api" else None),
         api_headers=_string_mapping(api.get("headers")),
     )
-
-
-def find_config_path(start: Path | None = None) -> Path | None:
-    explicit = os.environ.get("LEGACYLENS_CONFIG")
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-
-    current = (start or Path.cwd()).resolve()
-    for directory in (current, *current.parents):
-        for filename in CONFIG_FILENAMES:
-            candidate = directory / filename
-            if candidate.exists():
-                return candidate
-    return None
-
-
-def _load_config_payload() -> tuple[dict[str, Any], Path | None]:
-    path = find_config_path()
-    if path is None:
-        return {}, None
-    if not path.exists():
-        raise ValueError(f"Legacy Lens config file does not exist: {path}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Legacy Lens config file is invalid JSON: {path}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"Legacy Lens config file must contain a JSON object: {path}")
-    return payload, path
-
 
 def _resolve_api_url(api_url: str | None, api_base_url: str | None, api_path: str | None) -> str | None:
     if api_url:
@@ -673,15 +645,23 @@ def _unavailable_reason(client: LlmClient, exc: OSError) -> str:
     return f"{client.provider} unavailable: {exc}"
 
 
-def _log_llm_start(client: LlmClient, stream: bool, prompt: str, language: str, request: AnalysisRequest) -> None:
+def _log_llm_start(
+    client: LlmClient,
+    stream: bool,
+    prompt: str,
+    language: str,
+    request: AnalysisRequest,
+    output_language: OutputLanguage,
+) -> None:
     LOGGER.info(
-        "llm call start provider=%s model=%s host=%s stream=%s prompt_chars=%d language=%s file=%s cursor_line=%s",
+        "llm call start provider=%s model=%s host=%s stream=%s prompt_chars=%d language=%s output_language=%s file=%s cursor_line=%s",
         client.provider,
         _display_model(client.model),
         _safe_host(client.host),
         stream,
         len(prompt),
         language,
+        output_language.code,
         request.file_name or "unknown",
         request.cursor_line or "unknown",
     )
@@ -740,6 +720,7 @@ def _build_prompt(
     findings: list[Finding],
     facts: list[Fact],
     context: ProjectContext | None,
+    output_language: OutputLanguage,
 ) -> str:
     findings_text = "\n".join(
         f"- {finding.title} at line {finding.span.start_line}: {finding.rationale}"
@@ -749,15 +730,19 @@ def _build_prompt(
     context_text = _format_context_for_prompt(context)
     numbered_code_excerpt = _numbered_code_excerpt(request, limit=120)
     allowed_lines = ", ".join(str(line) for line in _allowed_line_numbers(request, findings, context))
+    section_names = ", ".join(output_language.section_names)
     return (
         "You are Legacy Lens, a code-reading assistant for legacy projects. The user hovers on a "
         "small code region and wants practical understanding, not a generic history lesson.\n\n"
-        "Write concise Simplified Chinese Markdown. Avoid repeating stock phrases. Do not include "
+        f"Write concise Markdown in {output_language.prompt_name}. If you cannot reliably write accurate technical "
+        f"analysis in {output_language.prompt_name}, write the whole answer in English instead. Do not mix languages "
+        "except for code identifiers, file paths, API names, and short quoted code. Translate analyzer findings and "
+        "idiom notes when summarizing them. Avoid repeating stock phrases. Do not include "
         "hidden reasoning, chain-of-thought, or <think> blocks.\n\n"
         "Line number rules are strict:\n"
         "- The numbered code excerpt below uses REAL file line numbers, not relative snippet lines.\n"
         "- Only cite a line number if it appears in Allowed evidence line numbers and the visible line text directly supports the claim.\n"
-        "- Never invent a line number. If no exact line supports a claim, say '在这段代码附近' instead of giving a line number.\n"
+        f"- Never invent a line number. If no exact line supports a claim, say '{output_language.near_code_phrase}' instead of giving a line number.\n"
         "- Prefer quoting the exact identifier or expression over adding extra line numbers.\n\n"
         "Your answer must focus on these points in this order:\n"
         "1. What this hovered code does at runtime, using concrete variable names and control flow.\n"
@@ -771,6 +756,7 @@ def _build_prompt(
         "5. What to inspect next. Mention historical constraints only when they directly explain a "
         "specific construct.\n\n"
         f"Language: {language}\n"
+        f"Output language: {output_language.prompt_name} ({output_language.code}); fallback language: English\n"
         f"File: {request.file_name or 'unknown'}\n"
         f"Hovered file line: {request.cursor_line or 'unknown'}\n"
         f"Excerpt starts at file line: {request.excerpt_start_line}\n"
@@ -779,7 +765,7 @@ def _build_prompt(
         f"Directory/project context:\n{context_text or '- none'}\n\n"
         f"Idiom notes, use only when relevant:\n{facts_text or '- none'}\n\n"
         f"Numbered code excerpt:\n```text\n{numbered_code_excerpt}\n```\n\n"
-        "Return Markdown with sections: 行为, 在当前目录/项目中的作用, 影响面, 下一步检查."
+        f"Return Markdown with these section headings: {section_names}."
     )
 
 
@@ -849,6 +835,7 @@ def _line_reference_warning(
     request: AnalysisRequest,
     findings: list[Finding],
     context: ProjectContext | None,
+    output_language: OutputLanguage | None = None,
 ) -> str | None:
     referenced = _extract_line_references(markdown)
     if not referenced:
@@ -857,9 +844,21 @@ def _line_reference_warning(
     invalid = sorted(line for line in referenced if line not in allowed)
     if not invalid:
         return None
+    invalid_text = ", ".join(str(line) for line in invalid)
+    if _warning_language(output_language) == "zh-Hans":
+        return (
+            "模型提到了未被悬停行、静态命中或符号引用支持的行号 "
+            f"{invalid_text}；这些行号应忽略，以编号代码片段和命中结果为准。"
+        )
+    if _warning_language(output_language) == "zh-Hant":
+        return (
+            "模型提到了未被懸停行、靜態命中或符號引用支持的行號 "
+            f"{invalid_text}；這些行號應忽略，以編號程式碼片段和命中結果為準。"
+        )
     return (
-        "模型提到了未被悬停行、静态命中或符号引用支持的行号 "
-        f"{', '.join(str(line) for line in invalid)}；这些行号应忽略，以编号代码片段和命中结果为准。"
+        "The model mentioned line numbers that are not supported by the hovered line, static findings, "
+        f"or symbol references: {invalid_text}. Ignore those line references and use the numbered excerpt "
+        "and findings as the evidence."
     )
 
 
@@ -868,18 +867,25 @@ def _append_line_reference_warning(
     request: AnalysisRequest,
     findings: list[Finding],
     context: ProjectContext | None,
+    output_language: OutputLanguage | None = None,
 ) -> str:
-    warning = _line_reference_warning(markdown, request, findings, context)
+    warning = _line_reference_warning(markdown, request, findings, context, output_language)
     if not warning:
         return markdown
-    return f"{markdown}\n\n> 行号校验：{warning}"
+    return f"{markdown}\n\n> {_line_warning_label(output_language)}: {warning}"
 
 
 def _extract_line_references(markdown: str) -> set[int]:
     references: set[int] = set()
     patterns = (
         r"第\s*(\d{1,6})\s*行",
+        r"(\d{1,6})\s*行",
         r"\bline\s+(\d{1,6})\b",
+        r"\bligne\s+(\d{1,6})\b",
+        r"\bl[ií]nea\s+(\d{1,6})\b",
+        r"\bzeile\s+(\d{1,6})\b",
+        r"\briga\s+(\d{1,6})\b",
+        r"\blinha\s+(\d{1,6})\b",
         r"\bL(\d{1,6})\b",
     )
     for pattern in patterns:
@@ -889,6 +895,23 @@ def _extract_line_references(markdown: str) -> set[int]:
             except ValueError:
                 continue
     return references
+
+
+def _line_warning_label(output_language: OutputLanguage | None = None) -> str:
+    warning_language = _warning_language(output_language)
+    if warning_language == "zh-Hans":
+        return "行号校验"
+    if warning_language == "zh-Hant":
+        return "行號校驗"
+    return "Line check"
+
+
+def _is_simplified_chinese(output_language: OutputLanguage | None = None) -> bool:
+    return (output_language or ENGLISH).deterministic_language == "zh-Hans"
+
+
+def _warning_language(output_language: OutputLanguage | None = None) -> str:
+    return (output_language or ENGLISH).code
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -988,6 +1011,66 @@ def _render_deterministic(
     facts: list[Fact],
     context: ProjectContext | None = None,
     request: AnalysisRequest | None = None,
+    output_language: OutputLanguage | None = None,
+) -> str:
+    if _is_simplified_chinese(output_language):
+        return _render_deterministic_zh(language, findings, facts, context, request)
+    return _render_deterministic_en(language, findings, facts, context, request)
+
+
+def _render_deterministic_en(
+    language: str,
+    findings: list[Finding],
+    facts: list[Fact],
+    context: ProjectContext | None = None,
+    request: AnalysisRequest | None = None,
+) -> str:
+    focus_line = _focus_line(request) if request else ""
+    if not findings:
+        lines = ["### Legacy Lens", "", "**Behavior**"]
+        if focus_line:
+            lines.append(f"- No high-confidence static rule matched near the hovered line; current line: `{focus_line}`.")
+        else:
+            lines.append(f"- No high-confidence static rule matched this {language} snippet.")
+        lines.extend(_context_summary_lines_en(context))
+        lines.extend(["", "**Next Checks**", "- Expand the hover context, or enable directory/project context and analyze again."])
+        return "\n".join(lines)
+
+    primary = findings[0]
+    lines = [
+        "### Legacy Lens",
+        "",
+        "**Behavior**",
+        f"- Line {primary.span.start_line} `{primary.span.text.strip()}` triggered `{primary.rule_id}` ({primary.title}).",
+    ]
+    if focus_line and focus_line != primary.span.text.strip():
+        lines.append(f"- Hovered line: `{focus_line}`.")
+    for finding in findings[1:4]:
+        lines.append(f"- Line {finding.span.start_line} `{finding.span.text.strip()}` triggered `{finding.rule_id}` ({finding.title}).")
+
+    lines.extend(_context_summary_lines_en(context))
+
+    if facts:
+        lines.extend(["", "**Related Idioms**"])
+        for fact in facts[:2]:
+            lines.append(f"- {fact.title}: {fact.summary}")
+
+    hints = [hint for hint in dict.fromkeys(finding.remediation_hint for finding in findings[:5] if finding.remediation_hint) if _mostly_ascii(hint)]
+    if hints:
+        lines.extend(["", "**Next Checks**"])
+        for hint in hints:
+            lines.append(f"- {hint}")
+    elif findings:
+        lines.extend(["", "**Next Checks**", "- Inspect callers, inputs, side effects, and nearby error handling before changing this code."])
+    return "\n".join(lines)
+
+
+def _render_deterministic_zh(
+    language: str,
+    findings: list[Finding],
+    facts: list[Fact],
+    context: ProjectContext | None = None,
+    request: AnalysisRequest | None = None,
 ) -> str:
     focus_line = _focus_line(request) if request else ""
     if not findings:
@@ -996,7 +1079,7 @@ def _render_deterministic(
             lines.append(f"- 悬停行附近没有命中高置信度规则；当前行是：`{focus_line}`。")
         else:
             lines.append(f"- 未在这段 {language} 代码中命中高置信度规则。")
-        lines.extend(_context_summary_lines(context))
+        lines.extend(_context_summary_lines_zh(context))
         lines.extend(["", "**下一步检查**", "- 扩大悬停上下文，或打开目录/项目上下文后再次分析。"])
         return "\n".join(lines)
 
@@ -1012,7 +1095,7 @@ def _render_deterministic(
     for finding in findings[1:4]:
         lines.append(f"- 第 {finding.span.start_line} 行 `{finding.span.text.strip()}`：{finding.rationale}")
 
-    lines.extend(_context_summary_lines(context))
+    lines.extend(_context_summary_lines_zh(context))
 
     if facts:
         lines.extend(["", "**相关惯用法**"])
@@ -1026,7 +1109,31 @@ def _render_deterministic(
     return "\n".join(lines)
 
 
-def _context_summary_lines(context: ProjectContext | None) -> list[str]:
+def _context_summary_lines_en(context: ProjectContext | None) -> list[str]:
+    lines = ["", "**Role In Current Context**"]
+    if context is None:
+        lines.append("- No directory or project context was provided, so only the snippet itself can be explained.")
+        return lines
+    if context.related_files:
+        examples = ", ".join(context.related_files[:5])
+        lines.append(f"- Found {len(context.related_files)} related files in `{context.scope}` scope, for example: {examples}.")
+    elif context.files:
+        lines.append(f"- The supplied context has {len(context.files)} files, but no clearly related files were detected.")
+    else:
+        lines.append("- No readable directory/project files were found.")
+    if context.symbol_references:
+        lines.extend(["", "**Impact**"])
+        for reference in context.symbol_references[:5]:
+            lines.append(
+                f"- `{reference.get('symbol')}` appears in `{reference.get('path')}:"
+                f"{reference.get('line')}`: {reference.get('text')}"
+            )
+    else:
+        lines.extend(["", "**Impact**", "- No cross-file symbol references were detected, so external callers cannot be inferred from this context."])
+    return lines
+
+
+def _context_summary_lines_zh(context: ProjectContext | None) -> list[str]:
     lines = ["", "**在当前目录/项目中的作用**"]
     if context is None:
         lines.append("- 未提供目录或项目上下文，因此只能解释片段本身。")
@@ -1048,6 +1155,13 @@ def _context_summary_lines(context: ProjectContext | None) -> list[str]:
     else:
         lines.extend(["", "**影响面**", "- 未发现跨文件符号引用；不能据此判断外部调用方。"])
     return lines
+
+
+def _mostly_ascii(text: str) -> bool:
+    if not text:
+        return False
+    ascii_count = sum(1 for char in text if ord(char) < 128)
+    return ascii_count / len(text) > 0.85
 
 
 def _focus_line(request: AnalysisRequest) -> str:

@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 
 type AnalyzeResponse = {
   language: string;
+  output_language?: string | null;
   markdown: string;
   findings: Array<{
     title: string;
@@ -19,6 +20,7 @@ type StreamEvent = {
   model_used?: string | null;
   fallback_reason?: string | null;
   language?: string;
+  output_language?: string | null;
   excerpt_start_line?: number;
   cursor_line?: number;
   findings?: Array<{ title: string; severity: string; span: { start_line: number; text: string } }>;
@@ -238,6 +240,8 @@ function buildAnalyzeBody(
   const maxContextLines = config.get<number>("maxContextLines", 80);
   const useLlm = useLlmOverride ?? config.get<boolean>("useLlm", true);
   const contextScope = config.get<string>("contextScope", "directory");
+  const outputLanguage = getOutputLanguage(config);
+  const uiLanguage = getUiLanguage();
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
 
   const hasSelection = selection && !selection.isEmpty;
@@ -258,6 +262,8 @@ function buildAnalyzeBody(
     maxFindings: 6,
     useLlm,
     contextScope,
+    outputLanguage,
+    uiLanguage,
   };
 }
 
@@ -386,7 +392,7 @@ async function consumeNdjsonStream(response: Response, onEvent: (event: StreamEv
 
 function streamingWebviewHtml(): string {
   return `<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -462,7 +468,7 @@ function streamingWebviewHtml(): string {
     <section class="bubble">
       <div class="role">Legacy Lens</div>
       <div id="answer"></div><span id="cursor" class="cursor"></span>
-      <div id="status" class="status">等待模型输出...</div>
+      <div id="status" class="status">Waiting for model output...</div>
     </section>
   </main>
   <script>
@@ -475,22 +481,23 @@ function streamingWebviewHtml(): string {
       if (message.type === 'reset') {
         answer.textContent = '';
         meta.textContent = message.fileName || '';
-        status.textContent = '正在分析上下文...';
+        status.textContent = 'Analyzing context...';
         cursor.style.display = 'inline-block';
       } else if (message.type === 'metadata') {
         const model = message.llm && message.llm.model ? message.llm.model : 'deterministic fallback';
         const count = Array.isArray(message.findings) ? message.findings.length : 0;
-        const line = message.cursor_line ? ' | 行: ' + message.cursor_line : '';
-        status.textContent = '语言: ' + (message.language || 'unknown') + line + ' | 命中: ' + count + ' | 模型: ' + model;
+        const line = message.cursor_line ? ' | line: ' + message.cursor_line : '';
+        const outputLanguage = message.output_language ? ' | output: ' + message.output_language : '';
+        status.textContent = 'Language: ' + (message.language || 'unknown') + outputLanguage + line + ' | findings: ' + count + ' | model: ' + model;
       } else if (message.type === 'delta') {
         answer.textContent += message.text || '';
         window.scrollTo(0, document.body.scrollHeight);
       } else if (message.type === 'fallback') {
-        status.textContent = '回退到本地解释: ' + (message.reason || '');
+        status.textContent = 'Fell back to local explanation: ' + (message.reason || '');
       } else if (message.type === 'done') {
         cursor.style.display = 'none';
         const fallback = message.fallback_reason ? ' | fallback: ' + message.fallback_reason : '';
-        status.textContent = '完成' + fallback;
+        status.textContent = 'Done' + fallback;
       } else if (message.type === 'error') {
         cursor.style.display = 'none';
         status.textContent = message.text || 'Unknown error';
@@ -504,6 +511,18 @@ function streamingWebviewHtml(): string {
 
 function getBackendUrl(config: vscode.WorkspaceConfiguration): string {
   return config.get<string>("backendUrl", "http://127.0.0.1:8765").replace(/\/$/, "");
+}
+
+function getOutputLanguage(config: vscode.WorkspaceConfiguration): string {
+  const configured = config.get<string>("outputLanguage", "auto").trim();
+  if (configured && configured.toLowerCase() !== "auto") {
+    return configured;
+  }
+  return "auto";
+}
+
+function getUiLanguage(): string {
+  return vscode.env.language || Intl.DateTimeFormat().resolvedOptions().locale || "en";
 }
 
 function abortSignalFromCancellation(token: vscode.CancellationToken): AbortSignal {

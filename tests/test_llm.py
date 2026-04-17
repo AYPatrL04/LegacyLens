@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 import json
 import sys
 import tempfile
@@ -24,7 +25,7 @@ class FakeLineHallucinationClient:
     host = "fake"
 
     def generate(self, prompt: str) -> str:
-        return "第 999 行会打开文件，但这个行号并不存在。"
+        return "line 999 opens a file, but that line does not exist."
 
 
 class FakeUnsupportedExistingLineClient:
@@ -33,7 +34,20 @@ class FakeUnsupportedExistingLineClient:
     host = "fake"
 
     def generate(self, prompt: str) -> str:
-        return "第 10 行会打开文件，但实际打开文件的是第 11 行。"
+        return "line 10 opens a file, but the evidence is on line 11."
+
+
+class FakePromptCaptureClient:
+    provider = "fake"
+    model = "fake-capture"
+    host = "fake"
+
+    def __init__(self) -> None:
+        self.prompt = ""
+
+    def generate(self, prompt: str) -> str:
+        self.prompt = prompt
+        return "ok"
 
 
 class FakeSuccessClient:
@@ -73,6 +87,16 @@ class FakeHttpResponse:
 
 
 class LlmTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        missing_config = Path(self._tmp.name) / "missing.json"
+        self._env = patch.dict("os.environ", {"LEGACYLENS_CONFIG": str(missing_config)}, clear=False)
+        self._env.start()
+
+    def tearDown(self) -> None:
+        self._env.stop()
+        self._tmp.cleanup()
+
     def test_select_preferred_model_uses_code_friendly_model(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(select_preferred_model(["llama3:8b", "qwen3.5:9b"]), "qwen3.5:9b")
@@ -149,6 +173,7 @@ class LlmTests(unittest.TestCase):
 
     def test_explainer_appends_warning_for_invalid_generated_line_number(self) -> None:
         request, finding = _request_and_finding()
+        request = replace(request, output_language="zh-CN")
         response = Explainer(client=FakeLineHallucinationClient()).explain(
             request,
             language="python",
@@ -156,11 +181,12 @@ class LlmTests(unittest.TestCase):
             facts=[],
             context=None,
         )
-        self.assertIn("行号校验", response.markdown)
+        self.assertIn("\u884c\u53f7\u6821\u9a8c", response.markdown)
         self.assertIn("999", response.markdown)
 
     def test_explainer_warns_when_existing_line_is_not_evidence_line(self) -> None:
         request, finding = _request_and_finding()
+        request = replace(request, output_language="zh-CN")
         response = Explainer(client=FakeUnsupportedExistingLineClient()).explain(
             request,
             language="python",
@@ -168,8 +194,41 @@ class LlmTests(unittest.TestCase):
             facts=[],
             context=None,
         )
-        self.assertIn("行号校验", response.markdown)
+        self.assertIn("\u884c\u53f7\u6821\u9a8c", response.markdown)
         self.assertIn("10", response.markdown)
+
+    def test_explainer_uses_requested_prompt_language_with_english_fallback_instruction(self) -> None:
+        request, finding = _request_and_finding()
+        request = replace(request, output_language="ja-JP")
+        client = FakePromptCaptureClient()
+
+        response = Explainer(client=client).explain(
+            request,
+            language="python",
+            findings=[finding],
+            facts=[],
+            context=None,
+        )
+
+        self.assertEqual(response.markdown, "ok")
+        self.assertIn("Output language: Japanese (ja); fallback language: English", client.prompt)
+        self.assertIn("If you cannot reliably write accurate technical analysis in Japanese", client.prompt)
+
+    def test_deterministic_fallback_uses_english_for_non_localized_locale(self) -> None:
+        request, finding = _request_and_finding()
+        request = replace(request, use_llm=False, output_language="ja-JP")
+
+        response = Explainer().explain(
+            request,
+            language="python",
+            findings=[finding],
+            facts=[],
+            context=None,
+        )
+
+        self.assertIn("**Behavior**", response.markdown)
+        self.assertIn("Line 11", response.markdown)
+        self.assertNotIn("\u884c\u4e3a", response.markdown)
 
     def test_explainer_logs_model_call_success_without_leaking_api_key(self) -> None:
         request, finding = _request_and_finding()

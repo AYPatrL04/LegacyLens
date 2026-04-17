@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from .config import logging_level
 from .engine import LegacyLensEngine
 from .llm import DEFAULT_OLLAMA_HOST, list_ollama_models
 from .models import AnalysisRequest
@@ -79,6 +79,7 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
                 {
                     "type": "metadata",
                     "language": inspected.language,
+                    "output_language": inspected.output_language,
                     "findings": [finding.to_dict() for finding in inspected.findings],
                     "facts": [fact.to_dict() for fact in inspected.facts],
                     "context": inspected.context.to_dict() if inspected.context else None,
@@ -197,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _configure_logging() -> None:
-    level_name = os.environ.get("LEGACYLENS_LOG_LEVEL", "INFO").strip().upper()
+    level_name = logging_level()
     level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 

@@ -42,6 +42,13 @@ flags = flags | 001;
 '@ | python -m legacylens analyze - --language c --cursor-line 2 --context-scope none --use-llm
 ```
 
+Choose an analysis output language. `auto` uses the config file, VS Code locale, or the backend system language; model prompts tell the model to fall back to English if it cannot reliably answer in the target language:
+
+```powershell
+$env:PYTHONPATH = "src"
+Get-Content sample.c | python -m legacylens analyze - --language c --output-language ja-JP --use-llm
+```
+
 Streaming analysis endpoint:
 
 ```powershell
@@ -49,6 +56,7 @@ $body = @{
   code = "def load(path):`n    return open(path).read()`n"
   fileName = "inline.py"
   language = "python"
+  outputLanguage = "zh-CN"
   cursorLine = 2
   contextScope = "none"
   useLlm = $true
@@ -75,6 +83,13 @@ Line numbers:
 - The LLM is instructed to cite only evidence lines: the hovered line, static-analysis hit lines, or symbol-reference lines.
 - If generated text mentions an unsupported line number, the backend appends a `行号校验` warning.
 
+Output language:
+
+- Config files may set `outputLanguage`, accepting values like `en`, `zh-CN`, `zh-TW`, `ja-JP`, `fr`, or `de`.
+- Resolution order is config `outputLanguage`, then VS Code locale, then backend system language.
+- Request `outputLanguage` is only used when config `outputLanguage` is `auto` or absent.
+- LLM prompts ask for the target language directly and instruct the model to use English for the whole answer if it cannot write accurate technical analysis in that language. The deterministic local fallback is localized for English and Simplified Chinese; other locales use English.
+
 Context modes:
 
 - `--context-scope none`: explain only the supplied snippet.
@@ -95,92 +110,53 @@ Supported language suffixes include legacy languages plus mainstream project fil
 
 Languages without a dedicated legacy analyzer use the profile-based `MainstreamAnalyzer`. It still shares common behavior rules where appropriate, but emitted rule IDs stay language-specific, such as `python.file-io`, `go.goroutine`, or `rust.result-propagation`. The LLM then explains the hovered code using those behavior signals plus directory/project context.
 
-By default, the backend uses local Ollama and auto-discovers a model through `http://127.0.0.1:11434/api/tags`.
-To force a local model:
+By default, the backend uses local Ollama and auto-discovers a model through the default local Ollama endpoint.
 
-```powershell
-$env:LEGACYLENS_OLLAMA_MODEL = "qwen3.5:9b"
-```
-
-Useful environment variables:
-
-- `LEGACYLENS_CONFIG`: explicit config file path.
-- `LEGACYLENS_LOG_LEVEL`: backend log level, default `INFO`.
-- `LEGACYLENS_LLM_MODE`: `local` or `api`; default `local`.
-- `LEGACYLENS_MODEL`: optional general model name.
-- `OLLAMA_HOST`: Ollama host, default `http://127.0.0.1:11434`.
-- `LEGACYLENS_OLLAMA_MODEL`: explicit model name.
-- `LEGACYLENS_OLLAMA_PREFER`: comma-separated preference list for auto-discovery, default starts with `qwen,deepseek`.
-- `LEGACYLENS_OLLAMA_TIMEOUT`: generation timeout in seconds, default `60`.
-- `LEGACYLENS_DISABLE_OLLAMA_AUTODISCOVERY`: set to `true` to disable model discovery.
-- `LEGACYLENS_API_URL`: full OpenAI-compatible Chat Completions URL.
-- `LEGACYLENS_API_BASE_URL`: API base URL.
-- `LEGACYLENS_API_PATH`: API path, default `/chat/completions`.
-- `LEGACYLENS_API_KEY`: API key.
-- `LEGACYLENS_API_KEY_ENV`: name of the environment variable that contains the API key.
-- `LEGACYLENS_API_MODEL`: optional API model name. If omitted, Legacy Lens omits `model` from the request body.
-
-## LLM Configuration File
+## Configuration File
 
 If no config file is present, Legacy Lens keeps the current local Ollama behavior.
 
 Config discovery order:
 
-1. `LEGACYLENS_CONFIG`.
+1. `LEGACYLENS_CONFIG`, only when you need to point at a specific config path.
 2. `.legacylens.local.json` found from the current working directory upward.
 3. `.legacylens.json` found from the current working directory upward.
 
 Both local config filenames are ignored by this repository's `.gitignore` because they may contain API keys.
 
-Local Ollama mode:
+Unified template:
 
 ```json
 {
+  "outputLanguage": "auto",
+  "logging": {
+    "level": "INFO"
+  },
   "llm": {
     "mode": "local",
+    "timeoutSeconds": 60,
+    "model": "",
     "local": {
-      "host": "http://127.0.0.1:11434",
-      "model": "qwen3.5:9b",
-      "prefer": ["qwen", "deepseek"],
+      "host": "",
+      "model": "",
+      "prefer": [],
       "disableAutodiscovery": false
-    }
-  }
-}
-```
-
-`local.model` is optional. If it is omitted, Legacy Lens auto-discovers a local Ollama model.
-
-API mode:
-
-```json
-{
-  "llm": {
-    "mode": "api",
+    },
     "api": {
-      "baseUrl": "https://api.example.com/v1",
+      "baseUrl": "",
       "path": "/chat/completions",
-      "apiKeyEnv": "LEGACYLENS_REMOTE_API_KEY",
-      "model": "optional-model-name"
+      "url": "",
+      "apiKey": "",
+      "apiKeyHeader": "Authorization",
+      "apiKeyPrefix": "Bearer ",
+      "model": "",
+      "headers": {}
     }
   }
 }
 ```
 
-API mode sends an OpenAI-compatible Chat Completions payload. `api.model` is optional; if omitted, the request body does not include `model`.
-
-You can use `api.url` instead of `baseUrl` plus `path`:
-
-```json
-{
-  "llm": {
-    "mode": "api",
-    "api": {
-      "url": "https://api.example.com/v1/chat/completions",
-      "apiKey": "not-recommended-in-repo"
-    }
-  }
-}
-```
+Set `llm.mode` to `local` for Ollama or `api` for an OpenAI-compatible Chat Completions endpoint. `local.model` and `api.model` are optional; if omitted, local mode can auto-discover a model and API mode omits the `model` field from the request body.
 
 ## Logging
 
@@ -194,11 +170,7 @@ The backend logs LLM call metadata at `INFO` level by default:
 
 Logs do not include source code, prompt text, or API keys. Query parameters named `api_key`, `key`, or `token` are redacted.
 
-Set the level with:
-
-```powershell
-$env:LEGACYLENS_LOG_LEVEL = "DEBUG"
-```
+Set the level with `logging.level` in the config file.
 
 ## VSCode Extension
 
@@ -232,6 +204,7 @@ Important settings:
 - `legacyLens.backendUrl`: backend URL, default `http://127.0.0.1:8765`.
 - `legacyLens.useLlm`: request the configured LLM provider, default `true`.
 - `legacyLens.hoverUseLlm`: use the configured LLM provider directly inside hover, default `true`. VSCode hover cannot stream partial output, so set this to `false` if you prefer faster deterministic hover text.
+- `legacyLens.outputLanguage`: VS Code-side output language setting, default `auto`. It is only used when project config `outputLanguage` is `auto` or absent.
 - `legacyLens.contextScope`: `none`, `directory`, or `project`; default `directory`.
 - `legacyLens.autoStartBackend`: start backend on first hover or command, default `true`.
 - `legacyLens.backendCommand`: command used to start backend, default `python`.
