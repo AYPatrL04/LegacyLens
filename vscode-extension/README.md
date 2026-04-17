@@ -126,3 +126,7 @@ npm run watch
 - `node_modules/`
 - `dist/`
 - `*.vsix`
+
+## License
+
+Legacy Lens VSCode Extension 随主仓库一起以 Apache License 2.0 发布，完整文本见仓库根目录的 `LICENSE`，包元数据使用 SPDX 标识 `Apache-2.0`。

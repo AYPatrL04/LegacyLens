@@ -3,6 +3,7 @@
   "displayName": "Legacy Lens",
   "description": "Hover explanations for legacy code idioms with historical context.",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "publisher": "local",
   "engines": {
     "vscode": "^1.92.0"

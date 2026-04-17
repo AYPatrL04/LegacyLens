@@ -310,3 +310,11 @@ npm run compile
 - `vscode-extension/node_modules/`
 - `vscode-extension/dist/`
 - IDE 本地配置，例如 `.idea/`，除非项目明确决定托管它们
+
+## License
+
+Legacy Lens 适合使用 Apache License 2.0，原因是当前仓库没有已有许可证冲突，Python 主包没有运行时依赖，VSCode 扩展的开发依赖主要是 MIT 或 Apache-2.0 许可；Apache-2.0 同时保留了宽松再分发、修改和商业使用空间，并提供明确的专利授权条款。
+
+本项目以 Apache License 2.0 发布，完整文本见仓库根目录的 `LICENSE`。包元数据使用标准 SPDX 标识 `Apache-2.0`。
+
+再分发或修改时请保留 `LICENSE`，保留源码中已有的版权、专利、商标和归属声明，并在修改过的文件中清楚标明变更。当前仓库没有单独的 `NOTICE` 文件；如果未来加入 `NOTICE`，分发衍生作品时也需要按 Apache-2.0 要求保留其中适用的归属说明。

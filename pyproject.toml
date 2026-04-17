@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Local backend for explaining legacy code idioms with historical context."
 readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+]
 dependencies = []
 
 [project.optional-dependencies]
