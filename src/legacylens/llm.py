@@ -1,18 +1,23 @@
 ﻿from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import time
-import urllib.error
-import urllib.request
+from functools import lru_cache
+from urllib.parse import SplitResult, urlsplit, urlunsplit
+
+import httpx
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Protocol
 
 from .config import find_config_path, load_config_payload
 from .i18n import ENGLISH, OutputLanguage, resolve_output_language
-from .models import AnalysisRequest, Fact, Finding, ProjectContext
+from .models import AnalysisRequest, Finding, ProjectContext
 
 DEFAULT_MODEL_PREFERENCES = (
     "qwen",
@@ -25,6 +30,7 @@ DEFAULT_MODEL_PREFERENCES = (
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_API_PATH = "/chat/completions"
 LOGGER = logging.getLogger("legacylens.llm")
+HTTP_LIMITS = httpx.Limits(max_keepalive_connections=8, max_connections=16)
 
 
 @dataclass(frozen=True)
@@ -35,10 +41,19 @@ class Explanation:
 
 
 @dataclass(frozen=True)
+class SectionPrompt:
+    index: int
+    heading: str
+    prompt: str
+
+
+@dataclass(frozen=True)
 class LlmConfig:
     mode: str = "local"
     config_path: str | None = None
     timeout_seconds: float = 60.0
+    parallel_sections: bool = False
+    parallel_section_limit: int = 4
     model: str | None = None
     ollama_host: str = DEFAULT_OLLAMA_HOST
     ollama_model: str | None = None
@@ -78,14 +93,13 @@ class Explainer:
         request: AnalysisRequest,
         language: str,
         findings: list[Finding],
-        facts: list[Fact],
         context: ProjectContext | None = None,
     ) -> Explanation:
         output_language = resolve_output_language(request.output_language, request.ui_language)
-        prompt = _build_prompt(request, language, findings, facts, context, output_language)
+        prompt = _build_prompt(request, language, findings, context, output_language)
         if not request.use_llm:
             LOGGER.info("llm disabled; using deterministic fallback language=%s file=%s", language, request.file_name or "unknown")
-            return Explanation(markdown=_render_deterministic(language, findings, facts, context, request, output_language))
+            return Explanation(markdown=_render_deterministic(language, findings, context, request, output_language))
 
         self._ensure_client()
 
@@ -93,7 +107,18 @@ class Explainer:
             started_at = time.monotonic()
             _log_llm_start(self.client, stream=False, prompt=prompt, language=language, request=request, output_language=output_language)
             try:
-                markdown = self.client.generate(prompt)
+                if _parallel_sections_enabled():
+                    markdown = asyncio.run(
+                        self._generate_parallel_markdown(
+                            request,
+                            language,
+                            findings,
+                            context,
+                            output_language,
+                        )
+                    )
+                else:
+                    markdown = self.client.generate(prompt)
                 if markdown:
                     _log_llm_success(self.client, stream=False, started_at=started_at, output_chars=len(markdown))
                     return Explanation(
@@ -103,7 +128,7 @@ class Explainer:
                 reason = _empty_response_reason(self.client)
                 _log_llm_fallback(self.client, reason, stream=False, started_at=started_at)
                 return Explanation(
-                    markdown=_render_deterministic(language, findings, facts, context, request, output_language),
+                    markdown=_render_deterministic(language, findings, context, request, output_language),
                     fallback_reason=reason,
                 )
             except OSError as exc:
@@ -111,14 +136,14 @@ class Explainer:
                 _log_llm_failure(self.client, exc, stream=False, started_at=started_at)
                 _log_llm_fallback(self.client, reason, stream=False, started_at=started_at)
                 return Explanation(
-                    markdown=_render_deterministic(language, findings, facts, context, request, output_language),
+                    markdown=_render_deterministic(language, findings, context, request, output_language),
                     fallback_reason=reason,
                 )
 
         reason = self._no_client_reason()
         LOGGER.warning("llm unavailable before call; using deterministic fallback reason=%s language=%s file=%s", reason, language, request.file_name or "unknown")
         return Explanation(
-            markdown=_render_deterministic(language, findings, facts, context, request, output_language),
+            markdown=_render_deterministic(language, findings, context, request, output_language),
             fallback_reason=reason,
         )
 
@@ -127,14 +152,13 @@ class Explainer:
         request: AnalysisRequest,
         language: str,
         findings: list[Finding],
-        facts: list[Fact],
         context: ProjectContext | None = None,
     ) -> Iterator[dict[str, Any]]:
         output_language = resolve_output_language(request.output_language, request.ui_language)
-        prompt = _build_prompt(request, language, findings, facts, context, output_language)
+        prompt = _build_prompt(request, language, findings, context, output_language)
         if not request.use_llm:
             LOGGER.info("llm disabled for stream; using deterministic fallback language=%s file=%s", language, request.file_name or "unknown")
-            markdown = _render_deterministic(language, findings, facts, context, request, output_language)
+            markdown = _render_deterministic(language, findings, context, request, output_language)
             yield {
                 "type": "delta",
                 "text": markdown,
@@ -149,7 +173,7 @@ class Explainer:
             yield {"type": "fallback", "reason": reason}
             yield {
                 "type": "delta",
-                "text": _render_deterministic(language, findings, facts, context, request, output_language),
+                "text": _render_deterministic(language, findings, context, request, output_language),
             }
             yield {"type": "done", "model_used": None, "fallback_reason": reason}
             return
@@ -159,10 +183,16 @@ class Explainer:
         started_at = time.monotonic()
         _log_llm_start(self.client, stream=True, prompt=prompt, language=language, request=request, output_language=output_language)
         try:
-            for text in self.client.generate_stream(prompt):
-                emitted = True
-                chunks.append(text)
-                yield {"type": "delta", "text": text}
+            if _parallel_sections_enabled():
+                for text in self._parallel_stream_sections(request, language, findings, context, output_language):
+                    emitted = True
+                    chunks.append(text)
+                    yield {"type": "delta", "text": text}
+            else:
+                for text in self.client.generate_stream(prompt):
+                    emitted = True
+                    chunks.append(text)
+                    yield {"type": "delta", "text": text}
         except OSError as exc:
             reason = _unavailable_reason(self.client, exc)
             _log_llm_failure(self.client, exc, stream=True, started_at=started_at)
@@ -170,7 +200,7 @@ class Explainer:
             yield {"type": "fallback", "reason": reason}
             yield {
                 "type": "delta",
-                "text": _render_deterministic(language, findings, facts, context, request, output_language),
+                "text": _render_deterministic(language, findings, context, request, output_language),
             }
             yield {"type": "done", "model_used": self.client.model, "fallback_reason": reason}
             return
@@ -181,7 +211,7 @@ class Explainer:
             yield {"type": "fallback", "reason": reason}
             yield {
                 "type": "delta",
-                "text": _render_deterministic(language, findings, facts, context, request, output_language),
+                "text": _render_deterministic(language, findings, context, request, output_language),
             }
             yield {"type": "done", "model_used": self.client.model, "fallback_reason": reason}
             return
@@ -240,6 +270,76 @@ class Explainer:
             return "API mode is configured but no API client could be created."
         return "Local Ollama model was not configured or auto-discovered."
 
+    async def _generate_parallel_markdown(
+        self,
+        request: AnalysisRequest,
+        language: str,
+        findings: list[Finding],
+        context: ProjectContext | None,
+        output_language: OutputLanguage,
+    ) -> str:
+        if self.client is None:
+            return ""
+        prompts = _build_section_prompts(request, language, findings, context, output_language)
+        semaphore = asyncio.Semaphore(_parallel_section_limit())
+
+        async def generate_section(spec: SectionPrompt) -> tuple[int, str]:
+            async with semaphore:
+                text = await asyncio.to_thread(self.client.generate, spec.prompt)
+            return spec.index, _normalize_section_markdown(spec.heading, text)
+
+        results = await asyncio.gather(*(generate_section(spec) for spec in prompts))
+        ordered = [text for _, text in sorted(results, key=lambda item: item[0]) if text.strip()]
+        if len(ordered) == len(prompts):
+            return "\n\n".join(ordered)
+        return self.client.generate(_build_prompt(request, language, findings, context, output_language))
+
+    def _parallel_stream_sections(
+        self,
+        request: AnalysisRequest,
+        language: str,
+        findings: list[Finding],
+        context: ProjectContext | None,
+        output_language: OutputLanguage,
+    ) -> Iterator[str]:
+        if self.client is None:
+            return iter(())
+
+        async def collect_sections() -> list[str]:
+            prompts = _build_section_prompts(request, language, findings, context, output_language)
+            semaphore = asyncio.Semaphore(_parallel_section_limit())
+            section_results: dict[int, str] = {}
+
+            async def generate_section(spec: SectionPrompt) -> tuple[int, str]:
+                async with semaphore:
+                    text = await asyncio.to_thread(self.client.generate, spec.prompt)
+                return spec.index, _normalize_section_markdown(spec.heading, text)
+
+            by_index: dict[int, str] = {}
+            ordered: list[str] = []
+            next_index = 0
+            for completed in asyncio.as_completed([generate_section(spec) for spec in prompts]):
+                index, text = await completed
+                section_results[index] = text
+                by_index[index] = text
+                while next_index in by_index:
+                    section_text = by_index.pop(next_index)
+                    if section_text.strip():
+                        if ordered:
+                            ordered.append("\n\n")
+                        ordered.append(section_text)
+                    next_index += 1
+            if next_index != len(prompts) or any(not section_results.get(spec.index, "").strip() for spec in prompts):
+                fallback = await asyncio.to_thread(
+                    self.client.generate,
+                    _build_prompt(request, language, findings, context, output_language),
+                )
+                return [fallback]
+            return ordered
+
+        for chunk in asyncio.run(collect_sections()):
+            yield chunk
+
 
 @dataclass(frozen=True)
 class OllamaClient:
@@ -277,63 +377,42 @@ class OllamaClient:
         return cls(host=resolved_host, model=model)
 
     def generate(self, prompt: str) -> str:
-        payload = json.dumps(
-            {
+        data = _post_json(
+            f"{self.host}/api/generate",
+            payload={
                 "model": self.model,
                 "prompt": prompt,
                 "stream": False,
                 "think": False,
                 "options": {"temperature": 0.2, "num_predict": 700},
-            }
-        ).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.host}/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+            },
+            timeout_seconds=self.timeout_seconds,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.URLError as exc:
-            raise OSError(str(exc)) from exc
         raw = str(data.get("response", "")).strip()
         cleaned = _strip_thinking(raw)
         return cleaned or raw
 
     def generate_stream(self, prompt: str) -> Iterator[str]:
-        payload = json.dumps(
-            {
+        for line in _stream_lines(
+            f"{self.host}/api/generate",
+            payload={
                 "model": self.model,
                 "prompt": prompt,
                 "stream": True,
                 "think": False,
                 "options": {"temperature": 0.2, "num_predict": 700},
-            }
-        ).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.host}/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    chunk = str(data.get("response", ""))
-                    if chunk:
-                        yield chunk
-                    if data.get("done"):
-                        break
-        except urllib.error.URLError as exc:
-            raise OSError(str(exc)) from exc
+            },
+            timeout_seconds=self.timeout_seconds,
+        ):
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            chunk = str(data.get("response", ""))
+            if chunk:
+                yield chunk
+            if data.get("done"):
+                break
 
 
 @dataclass(frozen=True)
@@ -367,53 +446,34 @@ class ApiClient:
         )
 
     def generate(self, prompt: str) -> str:
-        payload = self._payload(prompt, stream=False)
-        request = urllib.request.Request(
+        data = _post_json(
             self.url,
-            data=json.dumps(payload).encode("utf-8"),
+            payload=self._payload(prompt, stream=False),
             headers=self._headers(),
-            method="POST",
+            timeout_seconds=self.timeout_seconds,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise OSError(_http_error_message(exc)) from exc
-        except (urllib.error.URLError, ValueError) as exc:
-            raise OSError(str(exc)) from exc
         raw = _extract_api_content(data).strip()
         cleaned = _strip_thinking(raw)
         return cleaned or raw
 
     def generate_stream(self, prompt: str) -> Iterator[str]:
-        payload = self._payload(prompt, stream=True)
-        request = urllib.request.Request(
+        for line in _stream_lines(
             self.url,
-            data=json.dumps(payload).encode("utf-8"),
+            payload=self._payload(prompt, stream=True),
             headers=self._headers(),
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
-                    if line == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    chunk = _extract_api_delta(data)
-                    if chunk:
-                        yield chunk
-        except urllib.error.HTTPError as exc:
-            raise OSError(_http_error_message(exc)) from exc
-        except urllib.error.URLError as exc:
-            raise OSError(str(exc)) from exc
+            timeout_seconds=self.timeout_seconds,
+        ):
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line == "[DONE]":
+                break
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            chunk = _extract_api_delta(data)
+            if chunk:
+                yield chunk
 
     def _payload(self, prompt: str, stream: bool) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -445,14 +505,10 @@ def discover_ollama_model(host: str = DEFAULT_OLLAMA_HOST, preferences: tuple[st
     return select_preferred_model(models, preferences=preferences)
 
 
+@lru_cache(maxsize=16)
 def list_ollama_models(host: str = DEFAULT_OLLAMA_HOST, timeout_seconds: float = 2.0) -> list[str]:
     resolved_host = normalize_ollama_host(host)
-    request = urllib.request.Request(f"{resolved_host}/api/tags", method="GET")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, ValueError) as exc:
-        raise OSError(str(exc)) from exc
+    data = _get_json(f"{resolved_host}/api/tags", timeout_seconds=timeout_seconds)
 
     models = data.get("models", [])
     if not isinstance(models, list):
@@ -491,6 +547,7 @@ def normalize_ollama_host(host: str | None) -> str:
 def load_llm_config() -> LlmConfig:
     payload, config_path = load_config_payload()
     llm = _mapping(payload.get("llm")) or payload
+    analysis = _mapping(payload.get("analysis"))
     local = _mapping(llm.get("local")) or _mapping(llm.get("ollama")) or {}
     api = _mapping(llm.get("api")) or {}
 
@@ -516,6 +573,27 @@ def load_llm_config() -> LlmConfig:
         mode=mode,
         config_path=str(config_path) if config_path else None,
         timeout_seconds=timeout,
+        parallel_sections=_bool_value(
+            os.environ.get("LEGACYLENS_LLM_PARALLEL_SECTIONS"),
+            llm.get("parallelSections"),
+            llm.get("parallel_sections"),
+            analysis.get("parallelSections"),
+            analysis.get("parallel_sections"),
+            default=False,
+        ),
+        parallel_section_limit=max(
+            1,
+            int(
+                _float_value(
+                    os.environ.get("LEGACYLENS_LLM_PARALLEL_SECTION_LIMIT"),
+                    llm.get("parallelSectionLimit"),
+                    llm.get("parallel_section_limit"),
+                    analysis.get("parallelSectionLimit"),
+                    analysis.get("parallel_section_limit"),
+                    default=4.0,
+                )
+            ),
+        ),
         model=model,
         ollama_host=normalize_ollama_host(_first_string(os.environ.get("OLLAMA_HOST"), local.get("host"), llm.get("ollamaHost"), DEFAULT_OLLAMA_HOST)),
         ollama_model=_first_string(os.environ.get("LEGACYLENS_OLLAMA_MODEL"), os.environ.get("OLLAMA_MODEL"), local.get("model"), model if mode == "local" else None),
@@ -566,6 +644,110 @@ def _configured_model(config: LlmConfig) -> str | None:
     if config.mode == "api":
         return config.api_model or config.model
     return config.ollama_model or config.model
+
+
+@lru_cache(maxsize=16)
+def _client_for_origin(scheme: str, netloc: str, timeout_seconds: float) -> httpx.Client:
+    return httpx.Client(
+        timeout=timeout_seconds,
+        limits=HTTP_LIMITS,
+        follow_redirects=True,
+        http2=False,
+    )
+
+
+@lru_cache(maxsize=64)
+def _prepared_request_target(url: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+    parts = urlsplit(url)
+    if parts.scheme != "http" or not parts.hostname or _is_ip_address(parts.hostname):
+        return url, ()
+
+    resolved_ip = _resolve_hostname(parts.hostname)
+    if not resolved_ip:
+        return url, ()
+
+    port = parts.port
+    host_header = parts.hostname if port in {None, 80} else f"{parts.hostname}:{port}"
+    replacement_host = _format_host_for_netloc(resolved_ip)
+    if port is not None:
+        replacement_host = f"{replacement_host}:{port}"
+    replaced = SplitResult(
+        scheme=parts.scheme,
+        netloc=replacement_host,
+        path=parts.path,
+        query=parts.query,
+        fragment=parts.fragment,
+    )
+    return urlunsplit(replaced), (("Host", host_header),)
+
+
+def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, timeout_seconds: float = 60.0) -> dict[str, Any]:
+    response = _send_request(
+        "POST",
+        url,
+        json_payload=payload,
+        headers=headers,
+        timeout_seconds=timeout_seconds,
+    )
+    return _json_response(response)
+
+
+def _get_json(url: str, headers: dict[str, str] | None = None, timeout_seconds: float = 60.0) -> dict[str, Any]:
+    response = _send_request(
+        "GET",
+        url,
+        headers=headers,
+        timeout_seconds=timeout_seconds,
+    )
+    return _json_response(response)
+
+
+def _stream_lines(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, timeout_seconds: float = 60.0) -> Iterator[str]:
+    request_url, resolved_headers = _prepared_request_target(url)
+    merged_headers = _merge_headers(headers, resolved_headers)
+    client = _client_for_origin(urlsplit(url).scheme, urlsplit(url).netloc, timeout_seconds)
+    try:
+        with client.stream("POST", request_url, json=payload, headers=merged_headers, timeout=timeout_seconds) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                text = line if isinstance(line, str) else line.decode("utf-8", errors="replace")
+                stripped = text.strip()
+                if stripped:
+                    yield stripped
+    except httpx.HTTPStatusError as exc:
+        raise OSError(_http_error_message(exc)) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise OSError(str(exc)) from exc
+
+
+def _send_request(
+    method: str,
+    url: str,
+    json_payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = 60.0,
+) -> httpx.Response:
+    request_url, resolved_headers = _prepared_request_target(url)
+    merged_headers = _merge_headers(headers, resolved_headers)
+    client = _client_for_origin(urlsplit(url).scheme, urlsplit(url).netloc, timeout_seconds)
+    try:
+        response = client.request(method, request_url, json=json_payload, headers=merged_headers, timeout=timeout_seconds)
+        response.raise_for_status()
+        return response
+    except httpx.HTTPStatusError as exc:
+        raise OSError(_http_error_message(exc)) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise OSError(str(exc)) from exc
+
+
+def _json_response(response: httpx.Response) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise OSError(str(exc)) from exc
+    return data if isinstance(data, dict) else {}
 
 
 def _extract_api_content(data: dict[str, Any]) -> str:
@@ -626,14 +808,11 @@ def _content_to_text(value: Any) -> str:
     return ""
 
 
-def _http_error_message(exc: urllib.error.HTTPError) -> str:
-    try:
-        body = exc.read().decode("utf-8", errors="replace").strip()
-    except OSError:
-        body = ""
+def _http_error_message(exc: httpx.HTTPStatusError) -> str:
+    body = exc.response.text.strip()[:500]
     if body:
-        return f"HTTP {exc.code}: {body[:500]}"
-    return f"HTTP {exc.code}: {exc.reason}"
+        return f"HTTP {exc.response.status_code}: {body}"
+    return f"HTTP {exc.response.status_code}: {exc.response.reason_phrase}"
 
 
 def _empty_response_reason(client: LlmClient) -> str:
@@ -714,11 +893,134 @@ def _safe_host(host: str) -> str:
     return re.sub(r"([?&](?:api[_-]?key|key|token)=)[^&]+", r"\1<redacted>", host, flags=re.IGNORECASE)
 
 
+@lru_cache(maxsize=32)
+def _resolve_hostname(hostname: str) -> str | None:
+    try:
+        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return None
+    for family, _, _, _, sockaddr in infos:
+        if family in {socket.AF_INET, socket.AF_INET6}:
+            return str(sockaddr[0])
+    return None
+
+
+def _merge_headers(headers: dict[str, str] | None, extra_headers: tuple[tuple[str, str], ...]) -> dict[str, str]:
+    merged = dict(headers or {})
+    for key, value in extra_headers:
+        merged.setdefault(key, value)
+    return merged
+
+
+def _is_ip_address(hostname: str) -> bool:
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        return False
+
+
+def _format_host_for_netloc(hostname: str) -> str:
+    return f"[{hostname}]" if ":" in hostname else hostname
+
+
+def _parallel_sections_enabled() -> bool:
+    env_value = os.environ.get("LEGACYLENS_LLM_PARALLEL_SECTIONS")
+    if env_value is not None:
+        return _bool_value(env_value, default=False)
+    try:
+        return load_llm_config().parallel_sections
+    except ValueError:
+        return False
+
+
+def _parallel_section_limit() -> int:
+    env_value = os.environ.get("LEGACYLENS_LLM_PARALLEL_SECTION_LIMIT")
+    if env_value is not None:
+        try:
+            return max(1, int(float(env_value)))
+        except ValueError:
+            return 4
+    try:
+        return max(1, load_llm_config().parallel_section_limit)
+    except ValueError:
+        return 4
+
+
+def _build_section_prompts(
+    request: AnalysisRequest,
+    language: str,
+    findings: list[Finding],
+    context: ProjectContext | None,
+    output_language: OutputLanguage,
+) -> list[SectionPrompt]:
+    shared_prompt = _build_prompt_shared_context(request, language, findings, context, output_language)
+    section_instructions = (
+        ("What this hovered code does at runtime, with concrete variables and control flow.", output_language.section_names[0]),
+        ("What role this file or snippet appears to play in the current directory or project, using only supplied evidence.", output_language.section_names[1]),
+        ("What callers, data, or files may be affected, and what evidence supports that impact.", output_language.section_names[2]),
+        ("What to inspect next, including missing evidence or constraints that should be checked.", output_language.section_names[3]),
+    )
+    prompts: list[SectionPrompt] = []
+    for index, (instruction, heading) in enumerate(section_instructions):
+        prompts.append(
+            SectionPrompt(
+                index=index,
+                heading=heading,
+                prompt=(
+                    f"{shared_prompt}\n\n"
+                    "Write exactly one Markdown section.\n"
+                    f"Use the heading `## {heading}`.\n"
+                    f"Focus only on: {instruction}\n"
+                    "Include 2-4 concise bullets grounded in the provided evidence.\n"
+                    "Do not include any other section headings, introduction, conclusion, or fenced code block."
+                ),
+            )
+        )
+    return prompts
+
+
+def _normalize_section_markdown(heading: str, markdown: str) -> str:
+    cleaned = markdown.strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith(f"## {heading}"):
+        return cleaned
+    if cleaned.startswith(f"### {heading}"):
+        return f"## {heading}\n" + cleaned.split("\n", 1)[1].lstrip() if "\n" in cleaned else f"## {heading}"
+    return f"## {heading}\n{cleaned}"
+
+
 def _build_prompt(
     request: AnalysisRequest,
     language: str,
     findings: list[Finding],
-    facts: list[Fact],
+    context: ProjectContext | None,
+    output_language: OutputLanguage,
+) -> str:
+    shared_prompt = _build_prompt_shared_context(request, language, findings, context, output_language)
+    section_names = ", ".join(output_language.section_names)
+    return (
+        f"{shared_prompt}\n\n"
+        "Your answer must focus on these points in this order:\n"
+        "1. What this hovered code does at runtime, using concrete variable names and control flow.\n"
+        "2. What role this file or snippet appears to play in the current directory or project, based "
+        "only on the supplied file list and symbol references.\n"
+        "3. What role can be supported by evidence. Do not infer a relationship "
+        "from file co-location alone. If Related files and Symbol references are empty, say the snippet "
+        "looks standalone in the supplied context.\n"
+        "4. What callers/data/files may be affected, if there is evidence. If evidence is missing, "
+        "say that explicitly instead of inventing.\n"
+        "5. What to inspect next. Mention historical constraints only when they directly explain a "
+        "specific construct.\n\n"
+        f"Return Markdown with these section headings: {section_names}."
+    )
+
+
+def _build_prompt_shared_context(
+    request: AnalysisRequest,
+    language: str,
+    findings: list[Finding],
     context: ProjectContext | None,
     output_language: OutputLanguage,
 ) -> str:
@@ -726,11 +1028,9 @@ def _build_prompt(
         f"- {finding.title} at line {finding.span.start_line}: {finding.rationale}"
         for finding in findings[:6]
     )
-    facts_text = "\n".join(f"- {fact.title}: {fact.summary}" for fact in facts[:3])
     context_text = _format_context_for_prompt(context)
     numbered_code_excerpt = _numbered_code_excerpt(request, limit=120)
     allowed_lines = ", ".join(str(line) for line in _allowed_line_numbers(request, findings, context))
-    section_names = ", ".join(output_language.section_names)
     return (
         "You are Legacy Lens, a code-reading assistant for legacy projects. The user hovers on a "
         "small code region and wants practical understanding, not a generic history lesson.\n\n"
@@ -744,17 +1044,6 @@ def _build_prompt(
         "- Only cite a line number if it appears in Allowed evidence line numbers and the visible line text directly supports the claim.\n"
         f"- Never invent a line number. If no exact line supports a claim, say '{output_language.near_code_phrase}' instead of giving a line number.\n"
         "- Prefer quoting the exact identifier or expression over adding extra line numbers.\n\n"
-        "Your answer must focus on these points in this order:\n"
-        "1. What this hovered code does at runtime, using concrete variable names and control flow.\n"
-        "2. What role this file or snippet appears to play in the current directory or project, based "
-        "only on the supplied file list and symbol references.\n"
-        "3. What role can be supported by evidence. Do not infer a relationship "
-        "from file co-location alone. If Related files and Symbol references are empty, say the snippet "
-        "looks standalone in the supplied context.\n"
-        "4. What callers/data/files may be affected, if there is evidence. If evidence is missing, "
-        "say that explicitly instead of inventing.\n"
-        "5. What to inspect next. Mention historical constraints only when they directly explain a "
-        "specific construct.\n\n"
         f"Language: {language}\n"
         f"Output language: {output_language.prompt_name} ({output_language.code}); fallback language: English\n"
         f"File: {request.file_name or 'unknown'}\n"
@@ -763,9 +1052,8 @@ def _build_prompt(
         f"Allowed evidence line numbers: {allowed_lines or 'none'}\n"
         f"Findings:\n{findings_text or '- none'}\n\n"
         f"Directory/project context:\n{context_text or '- none'}\n\n"
-        f"Idiom notes, use only when relevant:\n{facts_text or '- none'}\n\n"
         f"Numbered code excerpt:\n```text\n{numbered_code_excerpt}\n```\n\n"
-        f"Return Markdown with these section headings: {section_names}."
+        "Ground every claim in the supplied evidence. If evidence is missing, say that explicitly."
     )
 
 
@@ -1008,20 +1296,18 @@ def _strip_thinking(text: str) -> str:
 def _render_deterministic(
     language: str,
     findings: list[Finding],
-    facts: list[Fact],
     context: ProjectContext | None = None,
     request: AnalysisRequest | None = None,
     output_language: OutputLanguage | None = None,
 ) -> str:
     if _is_simplified_chinese(output_language):
-        return _render_deterministic_zh(language, findings, facts, context, request)
-    return _render_deterministic_en(language, findings, facts, context, request)
+        return _render_deterministic_zh(language, findings, context, request)
+    return _render_deterministic_en(language, findings, context, request)
 
 
 def _render_deterministic_en(
     language: str,
     findings: list[Finding],
-    facts: list[Fact],
     context: ProjectContext | None = None,
     request: AnalysisRequest | None = None,
 ) -> str:
@@ -1050,11 +1336,6 @@ def _render_deterministic_en(
 
     lines.extend(_context_summary_lines_en(context))
 
-    if facts:
-        lines.extend(["", "**Related Idioms**"])
-        for fact in facts[:2]:
-            lines.append(f"- {fact.title}: {fact.summary}")
-
     hints = [hint for hint in dict.fromkeys(finding.remediation_hint for finding in findings[:5] if finding.remediation_hint) if _mostly_ascii(hint)]
     if hints:
         lines.extend(["", "**Next Checks**"])
@@ -1068,7 +1349,6 @@ def _render_deterministic_en(
 def _render_deterministic_zh(
     language: str,
     findings: list[Finding],
-    facts: list[Fact],
     context: ProjectContext | None = None,
     request: AnalysisRequest | None = None,
 ) -> str:
@@ -1097,10 +1377,6 @@ def _render_deterministic_zh(
 
     lines.extend(_context_summary_lines_zh(context))
 
-    if facts:
-        lines.extend(["", "**相关惯用法**"])
-        for fact in facts[:2]:
-            lines.append(f"- {fact.title}: {fact.summary}")
     hints = list(dict.fromkeys(finding.remediation_hint for finding in findings[:5] if finding.remediation_hint))
     if hints:
         lines.extend(["", "**下一步检查**"])

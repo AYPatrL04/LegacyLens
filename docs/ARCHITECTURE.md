@@ -8,8 +8,8 @@ This repository now contains a runnable MVP that follows the README's layered de
 2. The backend detects the language from an explicit hint, file extension, or content.
 3. A language analyzer emits structured findings with rule IDs, line spans, tags, and code-behavior rationale.
 4. When requested, the context scanner adds current-directory or project file context plus same-language symbol references.
-5. The fact store retrieves matching idiom notes from `legacy_facts.jsonl`.
-6. The explainer returns deterministic Markdown when LLM use is disabled, or calls the configured LLM provider when the request enables LLM use. The default provider is local Ollama; config can switch it to an OpenAI-compatible API.
+5. The explainer returns deterministic Markdown when LLM use is disabled, or calls the configured LLM provider when the request enables LLM use. The default provider is local Ollama; config can switch it to an OpenAI-compatible API.
+6. When `llm.parallelSections` is enabled, the explainer splits the final answer into section-specific prompts and runs them concurrently before merging them back into one Markdown response.
 
 ## Current MVP
 
@@ -21,11 +21,9 @@ This repository now contains a runnable MVP that follows the README's layered de
 - CLI: `legacylens analyze` and `legacylens serve`
 - Context modes: `none`, `directory`, and `project`, with conservative role inference.
 - VSCode extension: hover provider, streaming analyze-selection command, backend auto-start, context-scope setting, hover LLM setting, and model listing command.
-- Seed facts: `src/legacylens/data/legacy_facts.jsonl`
 
 ## Extension Points
 
 - Replace heuristic analyzers with Tree-sitter or ANTLR adapters behind the existing `Analyzer.analyze()` contract.
-- Replace `FactStore` with ChromaDB while keeping `retrieve(findings, query, limit)`.
 - Add richer LLM providers beside local Ollama and the OpenAI-compatible API client.
 - Persist user feedback as training or retrieval data for later fine-tuning.

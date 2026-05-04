@@ -124,6 +124,8 @@ Unified template:
   "llm": {
     "mode": "local",
     "timeoutSeconds": 60,
+    "parallelSections": false,
+    "parallelSectionLimit": 4,
     "local": {
       "host": "",
       "model": "",
@@ -150,6 +152,8 @@ Config fields:
 - `logging.level`: `DEBUG`, `INFO`, `WARNING`, `ERROR`, and similar Python logging levels.
 - `llm.mode`: `local` or `api`.
 - `llm.timeoutSeconds`: generation timeout.
+- `llm.parallelSections`: when true, split the final explanation into multiple section prompts and generate them concurrently.
+- `llm.parallelSectionLimit`: maximum number of concurrent section requests when `parallelSections` is enabled.
 - `llm.model`: general model name. `local.model` or `api.model` takes precedence.
 - `llm.local.host`: local Ollama host. Leave empty for the default.
 - `llm.local.model`: local model name. Leave empty to allow local autodiscovery.
@@ -282,7 +286,7 @@ Modern mainstream languages:
 The default runtime path is local:
 
 - The VS Code extension only calls `legacyLens.backendUrl`, default `http://127.0.0.1:8765`.
-- The Python backend analyzes code, scans local context, and reads the local fact store on the same machine.
+- The Python backend analyzes code and scans local context on the same machine.
 - The default LLM path calls local Ollama.
 - By default, project code, directory structure, hover snippets, and model output are not sent to an external API.
 - The extension has no telemetry or remote reporting logic.

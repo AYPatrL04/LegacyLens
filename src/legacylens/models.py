@@ -43,20 +43,6 @@ class Finding:
 
 
 @dataclass(frozen=True)
-class Fact:
-    fact_id: str
-    title: str
-    summary: str
-    tags: tuple[str, ...] = ()
-    source: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["tags"] = list(self.tags)
-        return payload
-
-
-@dataclass(frozen=True)
 class AnalysisRequest:
     code: str
     language: str | None = None
@@ -119,7 +105,6 @@ class ProjectContext:
 class AnalysisResponse:
     language: str
     findings: list[Finding] = field(default_factory=list)
-    facts: list[Fact] = field(default_factory=list)
     context: ProjectContext | None = None
     markdown: str = ""
     model_used: str | None = None
@@ -130,7 +115,6 @@ class AnalysisResponse:
         return {
             "language": self.language,
             "findings": [finding.to_dict() for finding in self.findings],
-            "facts": [fact.to_dict() for fact in self.facts],
             "context": self.context.to_dict() if self.context else None,
             "markdown": self.markdown,
             "model_used": self.model_used,

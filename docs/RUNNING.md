@@ -71,7 +71,7 @@ Invoke-WebRequest `
 
 `/analyze/stream` returns newline-delimited JSON events:
 
-- `metadata`: static analysis, facts, context, and model status. This is sent before LLM generation.
+- `metadata`: static analysis, context, and model status. This is sent before LLM generation.
 - `delta`: one generated text chunk. Clients should append it immediately.
 - `fallback`: why the backend fell back to deterministic local output.
 - `done`: final model and fallback status.

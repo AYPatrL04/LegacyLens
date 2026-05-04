@@ -81,7 +81,6 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
                     "language": inspected.language,
                     "output_language": inspected.output_language,
                     "findings": [finding.to_dict() for finding in inspected.findings],
-                    "facts": [fact.to_dict() for fact in inspected.facts],
                     "context": inspected.context.to_dict() if inspected.context else None,
                     "excerpt_start_line": request.excerpt_start_line,
                     "cursor_line": request.cursor_line,
@@ -92,7 +91,6 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
                 request,
                 language=inspected.language,
                 findings=inspected.findings,
-                facts=inspected.facts,
                 context=inspected.context,
             ):
                 self._write_ndjson(event)

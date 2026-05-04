@@ -11,7 +11,6 @@ from .analyzers import (
     mainstream_analyzer,
 )
 from .context import build_project_context
-from .facts import FactStore
 from .i18n import resolve_output_language
 from .language import detect_language
 from .llm import Explainer
@@ -19,8 +18,7 @@ from .models import AnalysisRequest, AnalysisResponse, Finding, Severity
 
 
 class LegacyLensEngine:
-    def __init__(self, fact_store: FactStore | None = None, explainer: Explainer | None = None) -> None:
-        self.fact_store = fact_store or FactStore()
+    def __init__(self, explainer: Explainer | None = None) -> None:
         self.explainer = explainer or Explainer()
 
     def inspect(self, request: AnalysisRequest) -> AnalysisResponse:
@@ -29,13 +27,11 @@ class LegacyLensEngine:
         findings = analyzer.analyze(request.code)
         findings = _rank_findings(findings, cursor_line=request.relative_cursor_line())[: request.max_findings]
         findings = _shift_findings_to_file_lines(findings, request.excerpt_start_line)
-        facts = self.fact_store.retrieve(findings, query=request.code, limit=3)
         context = build_project_context(request, language)
         return AnalysisResponse(
             language=language,
             output_language=resolve_output_language(request.output_language, request.ui_language).code,
             findings=findings,
-            facts=facts,
             context=context,
         )
 
@@ -45,14 +41,12 @@ class LegacyLensEngine:
             request,
             language=inspected.language,
             findings=inspected.findings,
-            facts=inspected.facts,
             context=inspected.context,
         )
         return AnalysisResponse(
             language=inspected.language,
             output_language=inspected.output_language,
             findings=inspected.findings,
-            facts=inspected.facts,
             context=inspected.context,
             markdown=explanation.markdown,
             model_used=explanation.model_used,

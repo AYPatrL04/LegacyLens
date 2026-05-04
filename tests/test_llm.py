@@ -1,6 +1,8 @@
 from pathlib import Path
 from dataclasses import replace
 import json
+import threading
+import time
 import sys
 import tempfile
 import unittest
@@ -11,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from legacylens.llm import (
     ApiClient,
     Explainer,
+    _prepared_request_target,
     client_from_configuration,
     load_llm_config,
     normalize_ollama_host,
@@ -68,22 +71,27 @@ class FakeFailureClient:
         raise OSError("network down")
 
 
-class FakeHttpResponse:
-    def __init__(self, payload: dict | None = None, lines: list[bytes] | None = None) -> None:
-        self.payload = payload or {}
-        self.lines = lines or []
+class FakeParallelSectionsClient:
+    provider = "fake"
+    model = "fake-parallel"
+    host = "fake"
 
-    def __enter__(self) -> "FakeHttpResponse":
-        return self
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
 
-    def __exit__(self, *args) -> None:
-        return None
-
-    def read(self) -> bytes:
-        return json.dumps(self.payload).encode("utf-8")
-
-    def __iter__(self):
-        return iter(self.lines)
+    def generate(self, prompt: str) -> str:
+        with self.lock:
+            self.prompts.append(prompt)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.05)
+        heading = _heading_from_prompt(prompt)
+        with self.lock:
+            self.active -= 1
+        return f"## {heading}\n- generated for {heading}"
 
 
 class LlmTests(unittest.TestCase):
@@ -143,14 +151,14 @@ class LlmTests(unittest.TestCase):
     def test_api_client_omits_model_when_not_configured_and_uses_api_key(self) -> None:
         captured: dict[str, object] = {}
 
-        def fake_urlopen(request, timeout):
-            captured["url"] = request.full_url
-            captured["payload"] = json.loads(request.data.decode("utf-8"))
-            captured["headers"] = {key.lower(): value for key, value in request.header_items()}
-            return FakeHttpResponse({"choices": [{"message": {"content": "ok"}}]})
+        def fake_post_json(url, payload, headers=None, timeout_seconds=60.0):
+            captured["url"] = url
+            captured["payload"] = payload
+            captured["headers"] = {key.lower(): value for key, value in (headers or {}).items()}
+            return {"choices": [{"message": {"content": "ok"}}]}
 
         client = ApiClient(url="https://api.example.test/v1/chat/completions", api_key="secret", model=None)
-        with patch("urllib.request.urlopen", fake_urlopen):
+        with patch("legacylens.llm._post_json", fake_post_json):
             self.assertEqual(client.generate("prompt"), "ok")
 
         self.assertEqual(captured["url"], "https://api.example.test/v1/chat/completions")
@@ -158,18 +166,21 @@ class LlmTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["authorization"], "Bearer secret")
 
     def test_api_client_streams_openai_compatible_events(self) -> None:
-        def fake_urlopen(request, timeout):
-            return FakeHttpResponse(
-                lines=[
-                    b'data: {"choices":[{"delta":{"content":"hello"}}]}\n',
-                    b'data: {"choices":[{"delta":{"content":" world"}}]}\n',
-                    b"data: [DONE]\n",
-                ]
-            )
+        def fake_stream_lines(url, payload, headers=None, timeout_seconds=60.0):
+            yield 'data: {"choices":[{"delta":{"content":"hello"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":" world"}}]}'
+            yield "data: [DONE]"
 
         client = ApiClient(url="https://api.example.test/v1/chat/completions", api_key="secret", model="remote-model")
-        with patch("urllib.request.urlopen", fake_urlopen):
+        with patch("legacylens.llm._stream_lines", fake_stream_lines):
             self.assertEqual(list(client.generate_stream("prompt")), ["hello", " world"])
+
+    def test_http_request_target_uses_cached_dns_for_plain_http(self) -> None:
+        with patch("legacylens.llm._resolve_hostname", return_value="203.0.113.10"):
+            resolved_url, headers = _prepared_request_target("http://example.test:8080/v1/chat")
+
+        self.assertEqual(resolved_url, "http://203.0.113.10:8080/v1/chat")
+        self.assertEqual(dict(headers), {"Host": "example.test:8080"})
 
     def test_explainer_appends_warning_for_invalid_generated_line_number(self) -> None:
         request, finding = _request_and_finding()
@@ -178,7 +189,6 @@ class LlmTests(unittest.TestCase):
             request,
             language="python",
             findings=[finding],
-            facts=[],
             context=None,
         )
         self.assertIn("\u884c\u53f7\u6821\u9a8c", response.markdown)
@@ -191,7 +201,6 @@ class LlmTests(unittest.TestCase):
             request,
             language="python",
             findings=[finding],
-            facts=[],
             context=None,
         )
         self.assertIn("\u884c\u53f7\u6821\u9a8c", response.markdown)
@@ -206,7 +215,6 @@ class LlmTests(unittest.TestCase):
             request,
             language="python",
             findings=[finding],
-            facts=[],
             context=None,
         )
 
@@ -222,7 +230,6 @@ class LlmTests(unittest.TestCase):
             request,
             language="python",
             findings=[finding],
-            facts=[],
             context=None,
         )
 
@@ -237,7 +244,6 @@ class LlmTests(unittest.TestCase):
                 request,
                 language="python",
                 findings=[finding],
-                facts=[],
                 context=None,
             )
 
@@ -257,7 +263,6 @@ class LlmTests(unittest.TestCase):
                 request,
                 language="python",
                 findings=[finding],
-                facts=[],
                 context=None,
             )
 
@@ -266,6 +271,48 @@ class LlmTests(unittest.TestCase):
         self.assertIn("llm call failed", logs)
         self.assertIn("llm fallback", logs)
         self.assertIn("network down", logs)
+
+    def test_explainer_parallelizes_section_generation(self) -> None:
+        request, finding = _request_and_finding()
+        request = replace(request, output_language="en")
+        client = FakeParallelSectionsClient()
+
+        with patch.dict("os.environ", {"LEGACYLENS_LLM_PARALLEL_SECTIONS": "1"}, clear=False):
+            response = Explainer(client=client).explain(
+                request,
+                language="python",
+                findings=[finding],
+                context=None,
+            )
+
+        self.assertEqual(response.model_used, "fake-parallel")
+        self.assertIn("## Behavior", response.markdown)
+        self.assertIn("## Role In Current Context", response.markdown)
+        self.assertIn("## Impact", response.markdown)
+        self.assertIn("## Next Checks", response.markdown)
+        self.assertEqual(len(client.prompts), 4)
+        self.assertGreaterEqual(client.max_active, 2)
+
+    def test_explainer_stream_emits_parallel_sections_in_order(self) -> None:
+        request, finding = _request_and_finding()
+        request = replace(request, output_language="en")
+        client = FakeParallelSectionsClient()
+
+        with patch.dict("os.environ", {"LEGACYLENS_LLM_PARALLEL_SECTIONS": "1"}, clear=False):
+            events = list(
+                Explainer(client=client).explain_stream(
+                    request,
+                    language="python",
+                    findings=[finding],
+                    context=None,
+                )
+            )
+
+        deltas = [event["text"] for event in events if event["type"] == "delta"]
+        self.assertTrue(deltas)
+        self.assertIn("## Behavior", "".join(deltas))
+        self.assertIn("## Next Checks", "".join(deltas))
+        self.assertEqual(events[-1]["type"], "done")
 
 
 def _request_and_finding() -> tuple[AnalysisRequest, Finding]:
@@ -286,6 +333,13 @@ def _request_and_finding() -> tuple[AnalysisRequest, Finding]:
         historical_context="",
     )
     return request, finding
+
+
+def _heading_from_prompt(prompt: str) -> str:
+    marker = "Use the heading `## "
+    start = prompt.index(marker) + len(marker)
+    end = prompt.index("`", start)
+    return prompt[start:end]
 
 
 if __name__ == "__main__":
