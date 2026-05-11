@@ -609,6 +609,11 @@
           "default": true,
           "description": "Automatically start the local Python backend when needed."
         },
+        "legacyLens.preloadProjectContext": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a workspace opens, asynchronously pre-read and cache part of the project context to reduce first-analysis latency."
+        },
         "legacyLens.backendCommand": {
           "type": "string",
           "default": "python",

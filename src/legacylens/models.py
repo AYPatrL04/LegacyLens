@@ -52,6 +52,7 @@ class AnalysisRequest:
     project_root: str | None = None
     excerpt_start_line: int = 1
     cursor_line: int | None = None
+    cursor_column: int | None = None
     max_findings: int = 8
     use_llm: bool = False
     context_scope: str = "none"
@@ -67,6 +68,7 @@ class AnalysisRequest:
             project_root=_first_present(payload, "project_root", "projectRoot"),
             excerpt_start_line=max(1, _optional_int(_first_present(payload, "excerpt_start_line", "excerptStartLine")) or 1),
             cursor_line=_optional_int(_first_present(payload, "cursor_line", "cursorLine")),
+            cursor_column=_optional_int(_first_present(payload, "cursor_column", "cursorColumn")),
             max_findings=max(1, _optional_int(_first_present(payload, "max_findings", "maxFindings")) or 8),
             use_llm=_optional_bool(_first_present(payload, "use_llm", "useLlm")),
             context_scope=_normalize_context_scope(_first_present(payload, "context_scope", "contextScope")),

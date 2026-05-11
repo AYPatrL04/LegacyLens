@@ -44,6 +44,28 @@ class ServerStreamTests(unittest.TestCase):
         self.assertIn("delta", event_types)
         self.assertEqual(event_types[-1], "done")
 
+    def test_warmup_endpoint_accepts_project_root(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), LegacyLensRequestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            payload = json.dumps({"projectRoot": str(Path.cwd())}).encode("utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/warmup",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = json.loads(response.read().decode("utf-8"))
+                status = response.status
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(status, 202)
+        self.assertTrue(body.get("queued"))
+
 
 if __name__ == "__main__":
     unittest.main()

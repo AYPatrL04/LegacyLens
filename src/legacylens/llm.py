@@ -7,7 +7,9 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
+from contextlib import contextmanager
 from functools import lru_cache
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
@@ -31,6 +33,7 @@ DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_API_PATH = "/chat/completions"
 LOGGER = logging.getLogger("legacylens.llm")
 HTTP_LIMITS = httpx.Limits(max_keepalive_connections=8, max_connections=16)
+OLLAMA_CALL_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,7 @@ class LlmClient(Protocol):
 class Explainer:
     def __init__(self, client: LlmClient | None = None) -> None:
         self.client = client
+        self.clients = [client] if client is not None else []
         self._client_checked = client is not None
         self._client_error: str | None = None
 
@@ -103,13 +107,16 @@ class Explainer:
 
         self._ensure_client()
 
-        if self.client is not None:
+        fallback_reasons: list[str] = []
+        for client in self.clients:
+            self.client = client
             started_at = time.monotonic()
-            _log_llm_start(self.client, stream=False, prompt=prompt, language=language, request=request, output_language=output_language)
+            _log_llm_start(client, stream=False, prompt=prompt, language=language, request=request, output_language=output_language)
             try:
-                if _parallel_sections_enabled():
+                if _parallel_sections_enabled(client):
                     markdown = asyncio.run(
                         self._generate_parallel_markdown(
+                            client,
                             request,
                             language,
                             findings,
@@ -118,29 +125,23 @@ class Explainer:
                         )
                     )
                 else:
-                    markdown = self.client.generate(prompt)
+                    markdown = client.generate(prompt)
                 if markdown:
-                    _log_llm_success(self.client, stream=False, started_at=started_at, output_chars=len(markdown))
+                    _log_llm_success(client, stream=False, started_at=started_at, output_chars=len(markdown))
                     return Explanation(
                         markdown=_append_line_reference_warning(markdown, request, findings, context, output_language),
-                        model_used=self.client.model,
+                        model_used=client.model,
                     )
-                reason = _empty_response_reason(self.client)
-                _log_llm_fallback(self.client, reason, stream=False, started_at=started_at)
-                return Explanation(
-                    markdown=_render_deterministic(language, findings, context, request, output_language),
-                    fallback_reason=reason,
-                )
+                reason = _empty_response_reason(client)
+                fallback_reasons.append(reason)
+                _log_llm_fallback(client, reason, stream=False, started_at=started_at)
             except OSError as exc:
-                reason = _unavailable_reason(self.client, exc)
-                _log_llm_failure(self.client, exc, stream=False, started_at=started_at)
-                _log_llm_fallback(self.client, reason, stream=False, started_at=started_at)
-                return Explanation(
-                    markdown=_render_deterministic(language, findings, context, request, output_language),
-                    fallback_reason=reason,
-                )
+                reason = _unavailable_reason(client, exc)
+                fallback_reasons.append(reason)
+                _log_llm_failure(client, exc, stream=False, started_at=started_at)
+                _log_llm_fallback(client, reason, stream=False, started_at=started_at)
 
-        reason = self._no_client_reason()
+        reason = fallback_reasons[-1] if fallback_reasons else self._no_client_reason()
         LOGGER.warning("llm unavailable before call; using deterministic fallback reason=%s language=%s file=%s", reason, language, request.file_name or "unknown")
         return Explanation(
             markdown=_render_deterministic(language, findings, context, request, output_language),
@@ -167,7 +168,7 @@ class Explainer:
             return
 
         self._ensure_client()
-        if self.client is None:
+        if not self.clients:
             reason = self._no_client_reason()
             LOGGER.warning("llm unavailable before stream; using deterministic fallback reason=%s language=%s file=%s", reason, language, request.file_name or "unknown")
             yield {"type": "fallback", "reason": reason}
@@ -178,50 +179,58 @@ class Explainer:
             yield {"type": "done", "model_used": None, "fallback_reason": reason}
             return
 
-        emitted = False
-        chunks: list[str] = []
-        started_at = time.monotonic()
-        _log_llm_start(self.client, stream=True, prompt=prompt, language=language, request=request, output_language=output_language)
-        try:
-            if _parallel_sections_enabled():
-                for text in self._parallel_stream_sections(request, language, findings, context, output_language):
+        fallback_reasons: list[str] = []
+        for client in self.clients:
+            self.client = client
+            emitted = False
+            chunks: list[str] = []
+            started_at = time.monotonic()
+            _log_llm_start(client, stream=True, prompt=prompt, language=language, request=request, output_language=output_language)
+            try:
+                if _parallel_sections_enabled(client):
+                    iterator = self._parallel_stream_sections(client, request, language, findings, context, output_language)
+                else:
+                    iterator = client.generate_stream(prompt)
+                for text in iterator:
                     emitted = True
                     chunks.append(text)
                     yield {"type": "delta", "text": text}
-            else:
-                for text in self.client.generate_stream(prompt):
-                    emitted = True
-                    chunks.append(text)
-                    yield {"type": "delta", "text": text}
-        except OSError as exc:
-            reason = _unavailable_reason(self.client, exc)
-            _log_llm_failure(self.client, exc, stream=True, started_at=started_at)
-            _log_llm_fallback(self.client, reason, stream=True, started_at=started_at)
-            yield {"type": "fallback", "reason": reason}
-            yield {
-                "type": "delta",
-                "text": _render_deterministic(language, findings, context, request, output_language),
-            }
-            yield {"type": "done", "model_used": self.client.model, "fallback_reason": reason}
+            except OSError as exc:
+                reason = _unavailable_reason(client, exc)
+                fallback_reasons.append(reason)
+                _log_llm_failure(client, exc, stream=True, started_at=started_at)
+                _log_llm_fallback(client, reason, stream=True, started_at=started_at)
+                if emitted:
+                    yield {"type": "fallback", "reason": reason}
+                    yield {
+                        "type": "delta",
+                        "text": _render_deterministic(language, findings, context, request, output_language),
+                    }
+                    yield {"type": "done", "model_used": client.model, "fallback_reason": reason}
+                    return
+                continue
+
+            if not emitted:
+                reason = _empty_response_reason(client)
+                fallback_reasons.append(reason)
+                _log_llm_fallback(client, reason, stream=True, started_at=started_at)
+                continue
+
+            _log_llm_success(client, stream=True, started_at=started_at, output_chars=sum(len(chunk) for chunk in chunks))
+            warning = _line_reference_warning("".join(chunks), request, findings, context, output_language)
+            if warning:
+                LOGGER.warning("llm line-reference warning provider=%s model=%s reason=%s", client.provider, _display_model(client.model), warning)
+                yield {"type": "delta", "text": f"\n\n> {_line_warning_label(output_language)}: {warning}"}
+            yield {"type": "done", "model_used": client.model, "fallback_reason": None}
             return
 
-        if not emitted:
-            reason = _empty_response_reason(self.client)
-            _log_llm_fallback(self.client, reason, stream=True, started_at=started_at)
-            yield {"type": "fallback", "reason": reason}
-            yield {
-                "type": "delta",
-                "text": _render_deterministic(language, findings, context, request, output_language),
-            }
-            yield {"type": "done", "model_used": self.client.model, "fallback_reason": reason}
-            return
-
-        _log_llm_success(self.client, stream=True, started_at=started_at, output_chars=sum(len(chunk) for chunk in chunks))
-        warning = _line_reference_warning("".join(chunks), request, findings, context, output_language)
-        if warning:
-            LOGGER.warning("llm line-reference warning provider=%s model=%s reason=%s", self.client.provider, _display_model(self.client.model), warning)
-            yield {"type": "delta", "text": f"\n\n> {_line_warning_label(output_language)}: {warning}"}
-        yield {"type": "done", "model_used": self.client.model, "fallback_reason": None}
+        reason = fallback_reasons[-1] if fallback_reasons else self._no_client_reason()
+        yield {"type": "fallback", "reason": reason}
+        yield {
+            "type": "delta",
+            "text": _render_deterministic(language, findings, context, request, output_language),
+        }
+        yield {"type": "done", "model_used": None, "fallback_reason": reason}
 
     def model_status(self) -> dict[str, str | bool | None]:
         self._ensure_client()
@@ -230,7 +239,7 @@ class Explainer:
         except ValueError:
             config = LlmConfig()
         return {
-            "available": self.client is not None,
+            "available": bool(self.clients),
             "provider": getattr(self.client, "provider", config.mode) if self.client else config.mode,
             "mode": config.mode,
             "model": getattr(self.client, "model", None) if self.client else _configured_model(config),
@@ -241,18 +250,21 @@ class Explainer:
     def _ensure_client(self) -> None:
         if self.client is None and not self._client_checked:
             try:
-                self.client = client_from_configuration()
+                self.clients = clients_from_configuration()
+                self.client = self.clients[0] if self.clients else None
             except ValueError as exc:
                 self.client = None
+                self.clients = []
                 self._client_error = str(exc)
                 LOGGER.warning("llm client configuration failed reason=%s", exc)
-            if self.client is not None:
-                LOGGER.info(
-                    "llm client configured provider=%s model=%s host=%s",
-                    self.client.provider,
-                    _display_model(self.client.model),
-                    _safe_host(self.client.host),
-                )
+            if self.clients:
+                for configured in self.clients:
+                    LOGGER.info(
+                        "llm client configured provider=%s model=%s host=%s",
+                        configured.provider,
+                        _display_model(configured.model),
+                        _safe_host(configured.host),
+                    )
             else:
                 LOGGER.warning("llm client not configured reason=%s", self._no_client_reason())
             self._client_checked = True
@@ -268,73 +280,78 @@ class Explainer:
             if not _resolve_api_url(config.api_url, config.api_base_url, config.api_path):
                 return "API mode is configured but no api.url or api.baseUrl was provided."
             return "API mode is configured but no API client could be created."
+        if config.mode == "auto":
+            return "Auto mode could not configure a usable local Ollama or API client."
         return "Local Ollama model was not configured or auto-discovered."
 
     async def _generate_parallel_markdown(
         self,
+        client: LlmClient,
         request: AnalysisRequest,
         language: str,
         findings: list[Finding],
         context: ProjectContext | None,
         output_language: OutputLanguage,
     ) -> str:
-        if self.client is None:
-            return ""
         prompts = _build_section_prompts(request, language, findings, context, output_language)
         semaphore = asyncio.Semaphore(_parallel_section_limit())
 
         async def generate_section(spec: SectionPrompt) -> tuple[int, str]:
             async with semaphore:
-                text = await asyncio.to_thread(self.client.generate, spec.prompt)
+                text = await asyncio.to_thread(client.generate, spec.prompt)
             return spec.index, _normalize_section_markdown(spec.heading, text)
 
-        results = await asyncio.gather(*(generate_section(spec) for spec in prompts))
+        results = await asyncio.gather(*(generate_section(spec) for spec in prompts), return_exceptions=True)
+        if any(isinstance(result, Exception) for result in results):
+            return client.generate(_build_prompt(request, language, findings, context, output_language))
         ordered = [text for _, text in sorted(results, key=lambda item: item[0]) if text.strip()]
         if len(ordered) == len(prompts):
             return "\n\n".join(ordered)
-        return self.client.generate(_build_prompt(request, language, findings, context, output_language))
+        return client.generate(_build_prompt(request, language, findings, context, output_language))
 
     def _parallel_stream_sections(
         self,
+        client: LlmClient,
         request: AnalysisRequest,
         language: str,
         findings: list[Finding],
         context: ProjectContext | None,
         output_language: OutputLanguage,
     ) -> Iterator[str]:
-        if self.client is None:
-            return iter(())
-
         async def collect_sections() -> list[str]:
             prompts = _build_section_prompts(request, language, findings, context, output_language)
             semaphore = asyncio.Semaphore(_parallel_section_limit())
-            section_results: dict[int, str] = {}
 
             async def generate_section(spec: SectionPrompt) -> tuple[int, str]:
                 async with semaphore:
-                    text = await asyncio.to_thread(self.client.generate, spec.prompt)
+                    text = await asyncio.to_thread(client.generate, spec.prompt)
                 return spec.index, _normalize_section_markdown(spec.heading, text)
 
-            by_index: dict[int, str] = {}
-            ordered: list[str] = []
-            next_index = 0
-            for completed in asyncio.as_completed([generate_section(spec) for spec in prompts]):
-                index, text = await completed
-                section_results[index] = text
-                by_index[index] = text
-                while next_index in by_index:
-                    section_text = by_index.pop(next_index)
-                    if section_text.strip():
-                        if ordered:
-                            ordered.append("\n\n")
-                        ordered.append(section_text)
-                    next_index += 1
-            if next_index != len(prompts) or any(not section_results.get(spec.index, "").strip() for spec in prompts):
+            results = await asyncio.gather(*(generate_section(spec) for spec in prompts), return_exceptions=True)
+            if any(isinstance(result, Exception) for result in results):
                 fallback = await asyncio.to_thread(
-                    self.client.generate,
+                    client.generate,
                     _build_prompt(request, language, findings, context, output_language),
                 )
                 return [fallback]
+            ordered: list[str] = []
+            resolved_results = sorted((result for result in results if not isinstance(result, Exception)), key=lambda item: item[0])
+            if len(resolved_results) != len(prompts):
+                fallback = await asyncio.to_thread(
+                    client.generate,
+                    _build_prompt(request, language, findings, context, output_language),
+                )
+                return [fallback]
+            for index, text in resolved_results:
+                if not text.strip():
+                    fallback = await asyncio.to_thread(
+                        client.generate,
+                        _build_prompt(request, language, findings, context, output_language),
+                    )
+                    return [fallback]
+                if ordered:
+                    ordered.append("\n\n")
+                ordered.append(text)
             return ordered
 
         for chunk in asyncio.run(collect_sections()):
@@ -377,42 +394,44 @@ class OllamaClient:
         return cls(host=resolved_host, model=model)
 
     def generate(self, prompt: str) -> str:
-        data = _post_json(
-            f"{self.host}/api/generate",
-            payload={
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False,
-                "think": False,
-                "options": {"temperature": 0.2, "num_predict": 700},
-            },
-            timeout_seconds=self.timeout_seconds,
-        )
+        with OLLAMA_CALL_LOCK:
+            data = _post_json(
+                f"{self.host}/api/generate",
+                payload={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "think": False,
+                    "options": {"temperature": 0.2, "num_predict": 700},
+                },
+                timeout_seconds=self.timeout_seconds,
+            )
         raw = str(data.get("response", "")).strip()
         cleaned = _strip_thinking(raw)
         return cleaned or raw
 
     def generate_stream(self, prompt: str) -> Iterator[str]:
-        for line in _stream_lines(
-            f"{self.host}/api/generate",
-            payload={
-                "model": self.model,
-                "prompt": prompt,
-                "stream": True,
-                "think": False,
-                "options": {"temperature": 0.2, "num_predict": 700},
-            },
-            timeout_seconds=self.timeout_seconds,
-        ):
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            chunk = str(data.get("response", ""))
-            if chunk:
-                yield chunk
-            if data.get("done"):
-                break
+        with OLLAMA_CALL_LOCK:
+            for line in _stream_lines(
+                f"{self.host}/api/generate",
+                payload={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": True,
+                    "think": False,
+                    "options": {"temperature": 0.2, "num_predict": 700},
+                },
+                timeout_seconds=self.timeout_seconds,
+            ):
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunk = str(data.get("response", ""))
+                if chunk:
+                    yield chunk
+                if data.get("done"):
+                    break
 
 
 @dataclass(frozen=True)
@@ -494,10 +513,26 @@ class ApiClient:
 
 
 def client_from_configuration(config: LlmConfig | None = None) -> LlmClient | None:
+    clients = clients_from_configuration(config)
+    return clients[0] if clients else None
+
+
+def clients_from_configuration(config: LlmConfig | None = None) -> list[LlmClient]:
     resolved = config or load_llm_config()
     if resolved.mode == "api":
-        return ApiClient.from_config(resolved)
-    return OllamaClient.from_config(resolved)
+        client = ApiClient.from_config(resolved)
+        return [client] if client is not None else []
+    if resolved.mode == "auto":
+        clients: list[LlmClient] = []
+        local = OllamaClient.from_config(resolved)
+        api = ApiClient.from_config(resolved)
+        if local is not None:
+            clients.append(local)
+        if api is not None:
+            clients.append(api)
+        return clients
+    client = OllamaClient.from_config(resolved)
+    return [client] if client is not None else []
 
 
 def discover_ollama_model(host: str = DEFAULT_OLLAMA_HOST, preferences: tuple[str, ...] | None = None) -> str | None:
@@ -620,6 +655,7 @@ def load_llm_config() -> LlmConfig:
         api_headers=_string_mapping(api.get("headers")),
     )
 
+
 def _resolve_api_url(api_url: str | None, api_base_url: str | None, api_path: str | None) -> str | None:
     if api_url:
         return api_url.strip()
@@ -637,12 +673,16 @@ def _resolve_api_url(api_url: str | None, api_base_url: str | None, api_path: st
 def _configured_host(config: LlmConfig) -> str | None:
     if config.mode == "api":
         return _resolve_api_url(config.api_url, config.api_base_url, config.api_path)
+    if config.mode == "auto":
+        return config.ollama_host or _resolve_api_url(config.api_url, config.api_base_url, config.api_path)
     return config.ollama_host
 
 
 def _configured_model(config: LlmConfig) -> str | None:
     if config.mode == "api":
         return config.api_model or config.model
+    if config.mode == "auto":
+        return config.ollama_model or config.api_model or config.model
     return config.ollama_model or config.model
 
 
@@ -707,7 +747,7 @@ def _stream_lines(url: str, payload: dict[str, Any], headers: dict[str, str] | N
     merged_headers = _merge_headers(headers, resolved_headers)
     client = _client_for_origin(urlsplit(url).scheme, urlsplit(url).netloc, timeout_seconds)
     try:
-        with client.stream("POST", request_url, json=payload, headers=merged_headers, timeout=timeout_seconds) as response:
+        with _stream_with_retry(client, request_url, payload, merged_headers, timeout_seconds) as response:
             response.raise_for_status()
             for line in response.iter_lines():
                 if not line:
@@ -719,7 +759,29 @@ def _stream_lines(url: str, payload: dict[str, Any], headers: dict[str, str] | N
     except httpx.HTTPStatusError as exc:
         raise OSError(_http_error_message(exc)) from exc
     except (httpx.HTTPError, ValueError) as exc:
-        raise OSError(str(exc)) from exc
+        retry_headers = dict(merged_headers)
+        retry_headers["Connection"] = "close"
+        try:
+            with httpx.Client(
+                timeout=timeout_seconds,
+                limits=httpx.Limits(max_keepalive_connections=0, max_connections=1),
+                follow_redirects=True,
+                http2=False,
+            ) as one_shot:
+                with one_shot.stream("POST", request_url, json=payload, headers=retry_headers, timeout=timeout_seconds) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
+                        text = line if isinstance(line, str) else line.decode("utf-8", errors="replace")
+                        stripped = text.strip()
+                        if stripped:
+                            yield stripped
+                    return
+        except httpx.HTTPStatusError as retry_exc:
+            raise OSError(_http_error_message(retry_exc)) from retry_exc
+        except (httpx.HTTPError, ValueError) as retry_exc:
+            raise OSError(str(retry_exc)) from retry_exc
 
 
 def _send_request(
@@ -733,13 +795,28 @@ def _send_request(
     merged_headers = _merge_headers(headers, resolved_headers)
     client = _client_for_origin(urlsplit(url).scheme, urlsplit(url).netloc, timeout_seconds)
     try:
-        response = client.request(method, request_url, json=json_payload, headers=merged_headers, timeout=timeout_seconds)
+        response = _request_with_retry(client, method, request_url, json_payload, merged_headers, timeout_seconds)
         response.raise_for_status()
         return response
     except httpx.HTTPStatusError as exc:
         raise OSError(_http_error_message(exc)) from exc
     except (httpx.HTTPError, ValueError) as exc:
-        raise OSError(str(exc)) from exc
+        retry_headers = dict(merged_headers)
+        retry_headers["Connection"] = "close"
+        try:
+            with httpx.Client(
+                timeout=timeout_seconds,
+                limits=httpx.Limits(max_keepalive_connections=0, max_connections=1),
+                follow_redirects=True,
+                http2=False,
+            ) as one_shot:
+                response = one_shot.request(method, request_url, json=json_payload, headers=retry_headers, timeout=timeout_seconds)
+                response.raise_for_status()
+                return response
+        except httpx.HTTPStatusError as retry_exc:
+            raise OSError(_http_error_message(retry_exc)) from retry_exc
+        except (httpx.HTTPError, ValueError) as retry_exc:
+            raise OSError(str(retry_exc)) from retry_exc
 
 
 def _json_response(response: httpx.Response) -> dict[str, Any]:
@@ -813,6 +890,52 @@ def _http_error_message(exc: httpx.HTTPStatusError) -> str:
     if body:
         return f"HTTP {exc.response.status_code}: {body}"
     return f"HTTP {exc.response.status_code}: {exc.response.reason_phrase}"
+
+
+def _request_with_retry(
+    client: httpx.Client,
+    method: str,
+    request_url: str,
+    json_payload: dict[str, Any] | None,
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> httpx.Response:
+    response = client.request(method, request_url, json=json_payload, headers=headers, timeout=timeout_seconds)
+    if response.status_code not in {502, 503, 504}:
+        return response
+    retry_headers = dict(headers)
+    retry_headers["Connection"] = "close"
+    with httpx.Client(
+        timeout=timeout_seconds,
+        limits=httpx.Limits(max_keepalive_connections=0, max_connections=1),
+        follow_redirects=True,
+        http2=False,
+    ) as one_shot:
+        return one_shot.request(method, request_url, json=json_payload, headers=retry_headers, timeout=timeout_seconds)
+
+
+@contextmanager
+def _stream_with_retry(
+    client: httpx.Client,
+    request_url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> Iterator[httpx.Response]:
+    with client.stream("POST", request_url, json=payload, headers=headers, timeout=timeout_seconds) as response:
+        if response.status_code not in {502, 503, 504}:
+            yield response
+            return
+    retry_headers = dict(headers)
+    retry_headers["Connection"] = "close"
+    with httpx.Client(
+        timeout=timeout_seconds,
+        limits=httpx.Limits(max_keepalive_connections=0, max_connections=1),
+        follow_redirects=True,
+        http2=False,
+    ) as one_shot:
+        with one_shot.stream("POST", request_url, json=payload, headers=retry_headers, timeout=timeout_seconds) as retry_response:
+            yield retry_response
 
 
 def _empty_response_reason(client: LlmClient) -> str:
@@ -924,12 +1047,20 @@ def _format_host_for_netloc(hostname: str) -> str:
     return f"[{hostname}]" if ":" in hostname else hostname
 
 
-def _parallel_sections_enabled() -> bool:
+def _parallel_sections_enabled(client: LlmClient | None = None) -> bool:
     env_value = os.environ.get("LEGACYLENS_LLM_PARALLEL_SECTIONS")
-    if env_value is not None:
-        return _bool_value(env_value, default=False)
+    configured = _bool_value(env_value, default=False) if env_value is not None else None
+    if configured is None:
+        try:
+            configured = load_llm_config().parallel_sections
+        except ValueError:
+            configured = False
+    if not configured:
+        return False
+    if client is not None and getattr(client, "provider", "") == "ollama":
+        return _truthy(os.environ.get("LEGACYLENS_OLLAMA_PARALLEL_SECTIONS"))
     try:
-        return load_llm_config().parallel_sections
+        return configured
     except ValueError:
         return False
 
@@ -1231,6 +1362,8 @@ def _first_raw_string(*values: Any) -> str:
 
 def _normalize_mode(value: str | None) -> str:
     normalized = (value or "local").strip().lower().replace("_", "-")
+    if normalized in {"auto", "hybrid", "fallback"}:
+        return "auto"
     if normalized in {"api", "remote", "http", "https", "openai", "openai-compatible", "chat-completions"}:
         return "api"
     return "local"

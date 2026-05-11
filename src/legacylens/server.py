@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .config import logging_level
+from .context import prewarm_project_context
 from .engine import LegacyLensEngine
+from .hotspots import prewarm_file_hotspots
 from .llm import DEFAULT_OLLAMA_HOST, list_ollama_models
 from .models import AnalysisRequest
 
@@ -24,20 +27,24 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NO_CONTENT, None)
 
     def do_GET(self) -> None:
-        if self.path == "/health":
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "ok": True,
-                    "service": "legacy-lens",
-                    "llm": self.engine.explainer.model_status(),
-                },
-            )
-            return
-        if self.path == "/models":
-            self._handle_models()
-            return
-        self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+        try:
+            if self.path == "/health":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "service": "legacy-lens",
+                        "llm": self.engine.explainer.model_status(),
+                    },
+                )
+                return
+            if self.path == "/models":
+                self._handle_models()
+                return
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+        except Exception as exc:
+            LOGGER.exception("request failed method=GET path=%s", self.path)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error", "detail": str(exc)})
 
     def do_POST(self) -> None:
         try:
@@ -48,12 +55,21 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
             if self.path == "/analyze/stream":
                 self._handle_analyze_stream(payload)
                 return
+            if self.path == "/warmup":
+                self._handle_warmup(payload)
+                return
+            if self.path == "/warmup-file":
+                self._handle_warmup_file(payload)
+                return
             if self.path == "/rpc":
                 self._handle_rpc(payload)
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:
+            LOGGER.exception("request failed method=POST path=%s", self.path)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error", "detail": str(exc)})
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -73,7 +89,8 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
             return
 
         inspected = self.engine.inspect(request)
-        self._start_ndjson_stream()
+        if not self._start_ndjson_stream():
+            return
         try:
             self._write_ndjson(
                 {
@@ -112,6 +129,26 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
         request = AnalysisRequest.from_mapping(params)
         response = self.engine.analyze(request)
         self._send_json(HTTPStatus.OK, {"jsonrpc": "2.0", "id": rpc_id, "result": response.to_dict()})
+
+    def _handle_warmup(self, payload: dict[str, Any]) -> None:
+        project_root = payload.get("projectRoot") or payload.get("project_root")
+        if not project_root:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "projectRoot is required"})
+            return
+        worker = threading.Thread(target=prewarm_project_context, args=(str(project_root),), daemon=True)
+        worker.start()
+        self._send_json(HTTPStatus.ACCEPTED, {"queued": True, "project_root": project_root})
+
+    def _handle_warmup_file(self, payload: dict[str, Any]) -> None:
+        file_name = payload.get("fileName") or payload.get("file_name")
+        code = str(payload.get("code", ""))
+        language = payload.get("language")
+        if not file_name or not code.strip():
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "fileName and code are required"})
+            return
+        worker = threading.Thread(target=prewarm_file_hotspots, args=(str(file_name), code, str(language) if language else None), daemon=True)
+        worker.start()
+        self._send_json(HTTPStatus.ACCEPTED, {"queued": True, "file_name": file_name})
 
     def _handle_models(self) -> None:
         status = self.engine.explainer.model_status()
@@ -153,25 +190,32 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: HTTPStatus, payload: Any) -> None:
         body = b"" if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "content-type")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "content-type")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
-    def _start_ndjson_stream(self) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "content-type")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-        self.end_headers()
+    def _start_ndjson_stream(self) -> bool:
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "content-type")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.end_headers()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
 
     def _write_ndjson(self, payload: dict[str, Any]) -> None:
         self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")

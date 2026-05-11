@@ -11,10 +11,12 @@ from .analyzers import (
     mainstream_analyzer,
 )
 from .context import build_project_context
+from .hotspots import augment_context_with_hotspots
 from .i18n import resolve_output_language
 from .language import detect_language
 from .llm import Explainer
 from .models import AnalysisRequest, AnalysisResponse, Finding, Severity
+from .response_cache import load_cached_response, store_cached_response
 
 
 class LegacyLensEngine:
@@ -28,6 +30,7 @@ class LegacyLensEngine:
         findings = _rank_findings(findings, cursor_line=request.relative_cursor_line())[: request.max_findings]
         findings = _shift_findings_to_file_lines(findings, request.excerpt_start_line)
         context = build_project_context(request, language)
+        context = augment_context_with_hotspots(request, context)
         return AnalysisResponse(
             language=language,
             output_language=resolve_output_language(request.output_language, request.ui_language).code,
@@ -36,6 +39,9 @@ class LegacyLensEngine:
         )
 
     def analyze(self, request: AnalysisRequest) -> AnalysisResponse:
+        cached = load_cached_response(request)
+        if cached is not None:
+            return cached
         inspected = self.inspect(request)
         explanation = self.explainer.explain(
             request,
@@ -43,7 +49,7 @@ class LegacyLensEngine:
             findings=inspected.findings,
             context=inspected.context,
         )
-        return AnalysisResponse(
+        response = AnalysisResponse(
             language=inspected.language,
             output_language=inspected.output_language,
             findings=inspected.findings,
@@ -52,6 +58,8 @@ class LegacyLensEngine:
             model_used=explanation.model_used,
             fallback_reason=explanation.fallback_reason,
         )
+        store_cached_response(request, response)
+        return response
 
     def _analyzer_for(self, language: str):
         if language in {"c", "cpp"}:

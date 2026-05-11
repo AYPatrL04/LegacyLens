@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .language import EXTENSION_LANGUAGE
@@ -78,6 +81,22 @@ KEYWORDS = {
     "void",
     "while",
 }
+DIRECTORY_FILE_LIMIT = 60
+PROJECT_FILE_LIMIT = 120
+REFERENCE_FILE_LIMIT = 300
+TEXT_CACHE_MAX_BYTES = 120_000
+CONTEXT_CACHE_TTL_SECONDS = 45.0
+
+
+@dataclass
+class _ProjectScanCacheEntry:
+    built_at: float
+    files: list[Path]
+    text_by_path: dict[Path, list[str]]
+
+
+_PROJECT_SCAN_CACHE: dict[str, _ProjectScanCacheEntry] = {}
+_PROJECT_SCAN_CACHE_LOCK = threading.Lock()
 
 
 def build_project_context(request: AnalysisRequest, language: str) -> ProjectContext | None:
@@ -91,14 +110,24 @@ def build_project_context(request: AnalysisRequest, language: str) -> ProjectCon
     if scope_root is None or not scope_root.exists():
         return ProjectContext(scope=request.context_scope, notes=["No readable context root was found."])
 
-    files = _collect_files(scope_root, limit=120 if request.context_scope == "project" else 60)
+    file_limit = PROJECT_FILE_LIMIT if request.context_scope == "project" else DIRECTORY_FILE_LIMIT
+    scan = _scan_project(scope_root, limit=max(file_limit, REFERENCE_FILE_LIMIT))
+    files = scan.files[:file_limit]
     related_files = _related_files(files, current_file, language)
     symbols = _extract_focus_symbols(request.code, request.relative_cursor_line())
-    references = _find_symbol_references(scope_root, symbols, current_file, language, limit=12)
+    references = _find_symbol_references(
+        scope_root,
+        scan.files,
+        scan.text_by_path,
+        symbols,
+        current_file,
+        language,
+        limit=12,
+    )
     notes: list[str] = []
     if symbols:
         notes.append(f"Focus symbols: {', '.join(symbols[:8])}.")
-    if len(files) >= (120 if request.context_scope == "project" else 60):
+    if len(scan.files) >= file_limit:
         notes.append("Context file list was truncated.")
 
     return ProjectContext(
@@ -111,6 +140,14 @@ def build_project_context(request: AnalysisRequest, language: str) -> ProjectCon
         symbol_references=references,
         notes=notes,
     )
+
+
+def prewarm_project_context(project_root: str | Path | None) -> bool:
+    root = _resolve_root_path(project_root)
+    if root is None or not root.exists():
+        return False
+    _scan_project(root, limit=REFERENCE_FILE_LIMIT, force_refresh=True)
+    return True
 
 
 def _resolve_file(file_name: str | None) -> Path | None:
@@ -137,6 +174,70 @@ def _resolve_root(project_root: str | None, current_file: Path | None, current_d
         if any((candidate / marker).exists() for marker in PROJECT_MARKERS):
             return candidate.resolve()
     return current_directory.resolve()
+
+
+def _resolve_root_path(project_root: str | Path | None) -> Path | None:
+    if project_root is None:
+        return None
+    root = Path(project_root)
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    try:
+        return root.resolve()
+    except OSError:
+        return root.absolute()
+
+
+def _scan_project(root: Path, limit: int, force_refresh: bool = False) -> _ProjectScanCacheEntry:
+    cache_key = _safe_relative_or_absolute(root)
+    now = time.monotonic()
+    with _PROJECT_SCAN_CACHE_LOCK:
+        cached = _PROJECT_SCAN_CACHE.get(cache_key)
+        if (
+            cached is not None
+            and not force_refresh
+            and now - cached.built_at <= CONTEXT_CACHE_TTL_SECONDS
+            and len(cached.files) >= limit
+        ):
+            return cached
+        if not force_refresh:
+            ancestor = _ancestor_cache_locked(root, limit=limit, now=now)
+            if ancestor is not None:
+                return ancestor
+
+    files = _collect_files(root, limit=limit)
+    text_by_path: dict[Path, list[str]] = {}
+    for path in files:
+        lines = _read_text_lines(path)
+        if lines is not None:
+            text_by_path[path] = lines
+
+    refreshed = _ProjectScanCacheEntry(built_at=now, files=files, text_by_path=text_by_path)
+    with _PROJECT_SCAN_CACHE_LOCK:
+        _PROJECT_SCAN_CACHE[cache_key] = refreshed
+    return refreshed
+
+
+def _ancestor_cache_locked(root: Path, limit: int, now: float) -> _ProjectScanCacheEntry | None:
+    root_text = _safe_relative_or_absolute(root)
+    best_match: _ProjectScanCacheEntry | None = None
+    best_prefix_length = -1
+    for cached_root, cached in _PROJECT_SCAN_CACHE.items():
+        if now - cached.built_at > CONTEXT_CACHE_TTL_SECONDS or len(cached.files) < limit:
+            continue
+        if root_text == cached_root or not root_text.startswith(f"{cached_root}/"):
+            continue
+        prefix_length = len(cached_root)
+        if prefix_length > best_prefix_length:
+            best_match = _slice_cache_for_descendant(root, cached)
+            best_prefix_length = prefix_length
+    return best_match
+
+
+def _slice_cache_for_descendant(root: Path, cached: _ProjectScanCacheEntry) -> _ProjectScanCacheEntry:
+    descendant_files = [path for path in cached.files if path == root or root in path.parents]
+    descendant_text = {path: lines for path, lines in cached.text_by_path.items() if path in descendant_files}
+    return _ProjectScanCacheEntry(built_at=cached.built_at, files=descendant_files, text_by_path=descendant_text)
 
 
 def _collect_files(root: Path, limit: int) -> list[Path]:
@@ -174,6 +275,8 @@ def _related_files(files: list[Path], current_file: Path | None, language: str) 
 
 def _find_symbol_references(
     root: Path,
+    files: list[Path],
+    text_by_path: dict[Path, list[str]],
     symbols: list[str],
     current_file: Path | None,
     language: str,
@@ -185,15 +288,11 @@ def _find_symbol_references(
     filtered_symbols = _reference_symbols(symbols)
     patterns = [(symbol, re.compile(rf"\b{re.escape(symbol)}\b", re.IGNORECASE)) for symbol in filtered_symbols[:8]]
     allowed_extensions = LANGUAGE_EXTENSIONS.get(language, REFERENCE_EXTENSIONS)
-    files = _collect_files(root, limit=300)
     for path in files:
         if path == current_file or path.suffix.lower() not in allowed_extensions:
             continue
-        try:
-            if path.stat().st_size > 200_000:
-                continue
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+        lines = text_by_path.get(path)
+        if lines is None:
             continue
         for index, line in enumerate(lines, start=1):
             matched = next((symbol for symbol, pattern in patterns if pattern.search(line)), None)
@@ -210,6 +309,15 @@ def _find_symbol_references(
             if len(references) >= limit:
                 return references
     return references
+
+
+def _read_text_lines(path: Path) -> list[str] | None:
+    try:
+        if path.stat().st_size > TEXT_CACHE_MAX_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
 
 
 def _extract_focus_symbols(code: str, cursor_line: int | None) -> list[str]:

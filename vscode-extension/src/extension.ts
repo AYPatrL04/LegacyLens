@@ -29,6 +29,9 @@ type StreamEvent = {
 
 let backendProcess: childProcess.ChildProcess | undefined;
 let outputChannel: vscode.OutputChannel;
+const warmupTimers = new Map<string, NodeJS.Timeout>();
+const hoverCache = new Map<string, { builtAt: number; response: AnalyzeResponse }>();
+const HOVER_CACHE_TTL_MS = 180000;
 
 const SUPPORTED_LANGUAGES = [
   "asm",
@@ -156,6 +159,49 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.window.showInformationMessage(`Legacy Lens Ollama models: ${response.models.join(", ") || "none"}`);
     }),
   );
+
+  void warmupOpenWorkspaces();
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      void warmupOpenWorkspaces();
+    }),
+  );
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor) {
+        void warmupDocument(editor.document);
+      }
+    }),
+  );
+  context.subscriptions.push(
+    vscode.workspace.onDidOpenTextDocument((document) => {
+      void warmupDocument(document);
+    }),
+  );
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((document) => {
+      void warmupDocument(document);
+    }),
+  );
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      const key = event.document.uri.toString();
+      const previous = warmupTimers.get(key);
+      if (previous) {
+        clearTimeout(previous);
+      }
+      warmupTimers.set(
+        key,
+        setTimeout(() => {
+          warmupTimers.delete(key);
+          void warmupDocument(event.document);
+        }, 700),
+      );
+    }),
+  );
+  for (const editor of vscode.window.visibleTextEditors) {
+    void warmupDocument(editor.document);
+  }
 }
 
 export function deactivate() {
@@ -174,6 +220,12 @@ async function analyzeDocumentContext(
     return undefined;
   }
 
+  const cacheKey = hoverCacheKey(document, position, config, useLlmOverride);
+  const cached = loadHoverCache(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   const body = buildAnalyzeBody(document, position, config, useLlmOverride);
   try {
     const response = await fetch(`${backendUrl}/analyze`, {
@@ -183,9 +235,12 @@ async function analyzeDocumentContext(
       signal: token ? abortSignalFromCancellation(token) : undefined,
     });
     if (!response.ok) {
+      outputChannel.appendLine(`Analyze returned HTTP ${response.status}: ${await safeReadText(response)}`);
       return undefined;
     }
-    return (await response.json()) as AnalyzeResponse;
+    const parsed = (await response.json()) as AnalyzeResponse;
+    storeHoverCache(cacheKey, parsed);
+    return parsed;
   } catch (error) {
     outputChannel.appendLine(`Analyze failed: ${String(error)}`);
     return undefined;
@@ -218,6 +273,7 @@ async function analyzeDocumentContextStream(editor: vscode.TextEditor): Promise<
       body: JSON.stringify(body),
     });
     if (!response.ok || !response.body) {
+      outputChannel.appendLine(`Streaming analyze returned HTTP ${response.status}: ${await safeReadText(response)}`);
       panel.webview.postMessage({ type: "error", text: `Backend returned HTTP ${response.status}` });
       return;
     }
@@ -259,6 +315,7 @@ function buildAnalyzeBody(
     projectRoot: workspaceFolder?.uri.fsPath,
     excerptStartLine: start + 1,
     cursorLine: position.line + 1,
+    cursorColumn: position.character + 1,
     maxFindings: 6,
     useLlm,
     contextScope,
@@ -281,6 +338,67 @@ async function ensureBackend(backendUrl: string, config: vscode.WorkspaceConfigu
   }
 
   return waitForBackend(backendUrl, 15000);
+}
+
+async function warmupOpenWorkspaces(): Promise<void> {
+  const config = vscode.workspace.getConfiguration("legacyLens");
+  if (!config.get<boolean>("preloadProjectContext", true)) {
+    return;
+  }
+
+  const backendUrl = getBackendUrl(config);
+  if (!(await ensureBackend(backendUrl, config))) {
+    return;
+  }
+
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    void warmupWorkspaceFolder(backendUrl, folder.uri.fsPath);
+  }
+}
+
+async function warmupWorkspaceFolder(backendUrl: string, projectRoot: string): Promise<void> {
+  try {
+    const response = await fetch(`${backendUrl}/warmup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectRoot }),
+    });
+    if (!response.ok) {
+      outputChannel.appendLine(`Warmup returned HTTP ${response.status}: ${await safeReadText(response)}`);
+    }
+  } catch (error) {
+    outputChannel.appendLine(`Warmup failed for ${projectRoot}: ${String(error)}`);
+  }
+}
+
+async function warmupDocument(document: vscode.TextDocument): Promise<void> {
+  if (document.isUntitled || !SUPPORTED_LANGUAGES.includes(document.languageId)) {
+    return;
+  }
+  const config = vscode.workspace.getConfiguration("legacyLens");
+  if (!config.get<boolean>("preloadProjectContext", true)) {
+    return;
+  }
+  const backendUrl = getBackendUrl(config);
+  if (!(await ensureBackend(backendUrl, config))) {
+    return;
+  }
+  try {
+    const response = await fetch(`${backendUrl}/warmup-file`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileName: document.fileName,
+        language: document.languageId,
+        code: document.getText(),
+      }),
+    });
+    if (!response.ok) {
+      outputChannel.appendLine(`File warmup returned HTTP ${response.status}: ${await safeReadText(response)}`);
+    }
+  } catch (error) {
+    outputChannel.appendLine(`File warmup failed for ${document.fileName}: ${String(error)}`);
+  }
 }
 
 function startBackend(config: vscode.WorkspaceConfiguration) {
@@ -317,6 +435,7 @@ function stopBackend() {
     backendProcess.kill();
   }
   backendProcess = undefined;
+  hoverCache.clear();
 }
 
 async function waitForBackend(backendUrl: string, timeoutMs: number): Promise<boolean> {
@@ -348,6 +467,14 @@ async function fetchJson<T>(url: string, timeoutMs = 5000): Promise<T | undefine
     return undefined;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function safeReadText(response: Response): Promise<string> {
+  try {
+    return (await response.text()).slice(0, 400);
+  } catch {
+    return "<unreadable response body>";
   }
 }
 
@@ -532,4 +659,53 @@ function abortSignalFromCancellation(token: vscode.CancellationToken): AbortSign
   }
   token.onCancellationRequested(() => controller.abort());
   return controller.signal;
+}
+
+function hoverCacheKey(
+  document: vscode.TextDocument,
+  position: vscode.Position,
+  config: vscode.WorkspaceConfiguration,
+  useLlmOverride?: boolean,
+): string {
+  const useLlm = useLlmOverride ?? config.get<boolean>("useLlm", true);
+  const contextScope = config.get<string>("contextScope", "directory");
+  const outputLanguage = getOutputLanguage(config);
+  const wordRange = document.getWordRangeAtPosition(position);
+  const startLine = wordRange ? wordRange.start.line : position.line;
+  const startCharacter = wordRange ? wordRange.start.character : position.character;
+  const endLine = wordRange ? wordRange.end.line : position.line;
+  const endCharacter = wordRange ? wordRange.end.character : position.character;
+  return [
+    document.uri.toString(),
+    document.version,
+    startLine,
+    startCharacter,
+    endLine,
+    endCharacter,
+    useLlm ? "1" : "0",
+    contextScope,
+    outputLanguage,
+  ].join("|");
+}
+
+function loadHoverCache(cacheKey: string): AnalyzeResponse | undefined {
+  const cached = hoverCache.get(cacheKey);
+  if (!cached) {
+    return undefined;
+  }
+  if (Date.now() - cached.builtAt > HOVER_CACHE_TTL_MS) {
+    hoverCache.delete(cacheKey);
+    return undefined;
+  }
+  return cached.response;
+}
+
+function storeHoverCache(cacheKey: string, response: AnalyzeResponse): void {
+  if (hoverCache.size >= 256) {
+    const oldest = hoverCache.keys().next();
+    if (!oldest.done) {
+      hoverCache.delete(oldest.value);
+    }
+  }
+  hoverCache.set(cacheKey, { builtAt: Date.now(), response });
 }
