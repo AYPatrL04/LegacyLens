@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import threading
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -14,7 +15,6 @@ from .engine import LegacyLensEngine
 from .hotspots import prewarm_file_hotspots
 from .llm import DEFAULT_OLLAMA_HOST, list_ollama_models
 from .models import AnalysisRequest
-
 
 LOGGER = logging.getLogger("legacylens.server")
 
@@ -27,67 +27,60 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NO_CONTENT, None)
 
     def do_GET(self) -> None:
-        try:
-            if self.path == "/health":
-                self._send_json(
+        self._dispatch_request(
+            {
+                "/health": lambda _payload: self._send_json(
                     HTTPStatus.OK,
                     {
                         "ok": True,
                         "service": "legacy-lens",
                         "llm": self.engine.explainer.model_status(),
                     },
-                )
-                return
-            if self.path == "/models":
-                self._handle_models()
-                return
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-        except Exception as exc:
-            LOGGER.exception("request failed method=GET path=%s", self.path)
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error", "detail": str(exc)})
+                ),
+                "/models": lambda _payload: self._handle_models(),
+            },
+            expects_body=False,
+        )
 
     def do_POST(self) -> None:
-        try:
-            payload = self._read_json()
-            if self.path == "/analyze":
-                self._handle_analyze(payload)
-                return
-            if self.path == "/analyze/stream":
-                self._handle_analyze_stream(payload)
-                return
-            if self.path == "/warmup":
-                self._handle_warmup(payload)
-                return
-            if self.path == "/warmup-file":
-                self._handle_warmup_file(payload)
-                return
-            if self.path == "/rpc":
-                self._handle_rpc(payload)
-                return
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-        except ValueError as exc:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-        except Exception as exc:
-            LOGGER.exception("request failed method=POST path=%s", self.path)
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error", "detail": str(exc)})
+        self._dispatch_request(
+            {
+                "/analyze": self._handle_analyze,
+                "/analyze/stream": self._handle_analyze_stream,
+                "/warmup": self._handle_warmup,
+                "/warmup-file": self._handle_warmup_file,
+                "/rpc": self._handle_rpc,
+            }
+        )
 
     def log_message(self, format: str, *args: Any) -> None:
         return
 
+    def _dispatch_request(
+        self,
+        routes: dict[str, Callable[[dict[str, Any]], None]],
+        expects_body: bool = True,
+    ) -> None:
+        try:
+            payload = self._read_json() if expects_body else {}
+            handler = routes.get(self.path)
+            if handler is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            handler(payload)
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:
+            LOGGER.exception("request failed method=%s path=%s", self.command, self.path)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error", "detail": str(exc)})
+
     def _handle_analyze(self, payload: dict[str, Any]) -> None:
-        request = AnalysisRequest.from_mapping(payload)
-        if not request.code.strip():
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "code is required"})
-            return
+        request = _analysis_request(payload)
         response = self.engine.analyze(request)
         self._send_json(HTTPStatus.OK, response.to_dict())
 
     def _handle_analyze_stream(self, payload: dict[str, Any]) -> None:
-        request = AnalysisRequest.from_mapping(payload)
-        if not request.code.strip():
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "code is required"})
-            return
-
+        request = _analysis_request(payload)
         inspected = self.engine.inspect(request)
         if not self._start_ndjson_stream():
             return
@@ -111,9 +104,7 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
                 context=inspected.context,
             ):
                 self._write_ndjson(event)
-        except BrokenPipeError:
-            return
-        except OSError:
+        except (BrokenPipeError, OSError):
             return
 
     def _handle_rpc(self, payload: dict[str, Any]) -> None:
@@ -125,29 +116,26 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
                 {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32601, "message": "method not found"}},
             )
             return
-        params = payload.get("params") or {}
-        request = AnalysisRequest.from_mapping(params)
+        request = _analysis_request(payload.get("params") or {})
         response = self.engine.analyze(request)
         self._send_json(HTTPStatus.OK, {"jsonrpc": "2.0", "id": rpc_id, "result": response.to_dict()})
 
     def _handle_warmup(self, payload: dict[str, Any]) -> None:
-        project_root = payload.get("projectRoot") or payload.get("project_root")
-        if not project_root:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "projectRoot is required"})
-            return
-        worker = threading.Thread(target=prewarm_project_context, args=(str(project_root),), daemon=True)
-        worker.start()
+        project_root = _required_string(payload, "projectRoot", "project_root")
+        threading.Thread(target=prewarm_project_context, args=(project_root,), daemon=True).start()
         self._send_json(HTTPStatus.ACCEPTED, {"queued": True, "project_root": project_root})
 
     def _handle_warmup_file(self, payload: dict[str, Any]) -> None:
-        file_name = payload.get("fileName") or payload.get("file_name")
+        file_name = _required_string(payload, "fileName", "file_name")
         code = str(payload.get("code", ""))
+        if not code.strip():
+            raise ValueError("fileName and code are required")
         language = payload.get("language")
-        if not file_name or not code.strip():
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "fileName and code are required"})
-            return
-        worker = threading.Thread(target=prewarm_file_hotspots, args=(str(file_name), code, str(language) if language else None), daemon=True)
-        worker.start()
+        threading.Thread(
+            target=prewarm_file_hotspots,
+            args=(file_name, code, str(language) if language else None),
+            daemon=True,
+        ).start()
         self._send_json(HTTPStatus.ACCEPTED, {"queued": True, "file_name": file_name})
 
     def _handle_models(self) -> None:
@@ -156,21 +144,22 @@ class LegacyLensRequestHandler(BaseHTTPRequestHandler):
             selected = status.get("model")
             self._send_json(
                 HTTPStatus.OK,
-                {
-                    "provider": "api",
-                    "models": [selected] if selected else [],
-                    "selected": selected,
-                    "llm": status,
-                },
+                {"provider": "api", "models": [selected] if selected else [], "selected": selected, "llm": status},
             )
             return
-
         host = status.get("host") or DEFAULT_OLLAMA_HOST
         try:
             models = list_ollama_models(str(host))
-            self._send_json(HTTPStatus.OK, {"provider": "ollama", "models": models, "selected": status.get("model"), "llm": status})
+            payload = {"provider": "ollama", "models": models, "selected": status.get("model"), "llm": status}
         except OSError as exc:
-            self._send_json(HTTPStatus.OK, {"provider": "ollama", "models": [], "selected": status.get("model"), "llm": status, "error": str(exc)})
+            payload = {
+                "provider": "ollama",
+                "models": [],
+                "selected": status.get("model"),
+                "llm": status,
+                "error": str(exc),
+            }
+        self._send_json(HTTPStatus.OK, payload)
 
     def _read_json(self) -> dict[str, Any]:
         try:
@@ -243,6 +232,21 @@ def _configure_logging() -> None:
     level_name = logging_level()
     level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+
+def _analysis_request(payload: dict[str, Any]) -> AnalysisRequest:
+    request = AnalysisRequest.from_mapping(payload)
+    if not request.code.strip():
+        raise ValueError("code is required")
+    return request
+
+
+def _required_string(payload: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    raise ValueError(f"{keys[0]} is required")
 
 
 if __name__ == "__main__":

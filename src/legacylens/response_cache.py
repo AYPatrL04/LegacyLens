@@ -10,10 +10,12 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
+from .config import first_string, load_config_payload_or_empty, mapping
 from .models import AnalysisRequest, AnalysisResponse, Finding, ProjectContext, Severity, SourceSpan
 
+IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 MEMORY_CACHE_TTL_SECONDS = 180.0
 MEMORY_CACHE_MAX_ENTRIES = 256
 REDIS_CACHE_TTL_SECONDS = 21_600
@@ -22,67 +24,90 @@ REDIS_DEFAULT_HOST = "127.0.0.1"
 REDIS_DEFAULT_PORT = 6379
 REDIS_KEY_PREFIX = "legacylens:hover:"
 REDIS_INDEX_KEY = f"{REDIS_KEY_PREFIX}index"
-IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 @dataclass(frozen=True)
-class _ResponseCacheEntry:
+class CacheKey:
+    file_name: str
+    language: str
+    output_language: str
+    ui_language: str
+    context_scope: str
+    use_llm: bool
+    cursor_line: int
+    cursor_column: int
+
+    def redis_key(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(self.file_name.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        digest.update(self.language.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        digest.update(self.output_language.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        digest.update(self.ui_language.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        digest.update(self.context_scope.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        digest.update(str(int(self.use_llm)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(self.cursor_line).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(self.cursor_column).encode("ascii"))
+        return f"{REDIS_KEY_PREFIX}{digest.hexdigest()}"
+
+
+@dataclass(frozen=True)
+class CacheEntry:
     built_at: float
-    response: AnalysisResponse
     request_digest: str
+    response: AnalysisResponse
 
 
-_RESPONSE_CACHE: dict[str, _ResponseCacheEntry] = {}
-_RESPONSE_CACHE_LOCK = threading.Lock()
-_REDIS_CLIENT: "_RedisCacheClient | None" = None
-_REDIS_CLIENT_LOCK = threading.Lock()
+class MemoryResponseCache:
+    def __init__(self, ttl_seconds: float, max_entries: int) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self._entries: dict[str, CacheEntry] = {}
+        self._lock = threading.Lock()
+
+    def get(self, cache_key: str, request_digest: str) -> AnalysisResponse | None:
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(cache_key)
+            if entry is None:
+                return None
+            if now - entry.built_at > self.ttl_seconds or entry.request_digest != request_digest:
+                self._entries.pop(cache_key, None)
+                return None
+            return copy.deepcopy(entry.response)
+
+    def set(self, cache_key: str, request_digest: str, response: AnalysisResponse) -> None:
+        entry = CacheEntry(
+            built_at=time.monotonic(),
+            request_digest=request_digest,
+            response=copy.deepcopy(response),
+        )
+        with self._lock:
+            if len(self._entries) >= self.max_entries:
+                oldest_key = min(self._entries.items(), key=lambda item: item[1].built_at)[0]
+                self._entries.pop(oldest_key, None)
+            self._entries[cache_key] = entry
 
 
-def load_cached_response(request: AnalysisRequest) -> AnalysisResponse | None:
-    cache_key = _position_cache_key(request)
-    request_digest = _request_digest(request)
-    redis_client = _redis_client()
-    if redis_client is not None:
-        cached = redis_client.get(cache_key, request_digest)
-        if cached is not None:
-            return cached
-
-    now = time.monotonic()
-    with _RESPONSE_CACHE_LOCK:
-        entry = _RESPONSE_CACHE.get(cache_key)
-        if entry is None:
-            return None
-        if now - entry.built_at > MEMORY_CACHE_TTL_SECONDS or entry.request_digest != request_digest:
-            _RESPONSE_CACHE.pop(cache_key, None)
-            return None
-        return copy.deepcopy(entry.response)
-
-
-def store_cached_response(request: AnalysisRequest, response: AnalysisResponse) -> None:
-    cache_key = _position_cache_key(request)
-    request_digest = _request_digest(request)
-    entry = _ResponseCacheEntry(
-        built_at=time.monotonic(),
-        response=copy.deepcopy(response),
-        request_digest=request_digest,
-    )
-    with _RESPONSE_CACHE_LOCK:
-        if len(_RESPONSE_CACHE) >= MEMORY_CACHE_MAX_ENTRIES:
-            oldest_key = min(_RESPONSE_CACHE.items(), key=lambda item: item[1].built_at)[0]
-            _RESPONSE_CACHE.pop(oldest_key, None)
-        _RESPONSE_CACHE[cache_key] = entry
-
-    redis_client = _redis_client()
-    if redis_client is not None:
-        redis_client.set(cache_key, request_digest, response)
-
-
-class _RedisCacheClient:
+class RedisResponseCache:
     def __init__(self, host: str, port: int, timeout_seconds: float = 0.5) -> None:
         self.host = host
         self.port = port
         self.timeout_seconds = timeout_seconds
         self._lock = threading.Lock()
+
+    def ping(self) -> bool:
+        try:
+            with self._lock:
+                return self._command("PING") in {b"PONG", "PONG"}
+        except Exception:
+            return False
 
     def get(self, cache_key: str, request_digest: str) -> AnalysisResponse | None:
         try:
@@ -90,44 +115,43 @@ class _RedisCacheClient:
                 payload = self._command("GET", cache_key)
                 if payload is None:
                     return None
-                if not isinstance(payload, (bytes, str)):
-                    return None
-                raw = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+                raw = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
                 parsed = json.loads(raw)
                 if not isinstance(parsed, dict) or parsed.get("request_digest") != request_digest:
                     return None
+                self._touch(cache_key)
                 response_payload = parsed.get("response")
                 if not isinstance(response_payload, dict):
                     return None
-                self._command("ZADD", REDIS_INDEX_KEY, str(time.time()), cache_key)
                 return _response_from_dict(response_payload)
         except Exception:
             return None
 
     def set(self, cache_key: str, request_digest: str, response: AnalysisResponse) -> None:
-        payload = json.dumps(
-            {
-                "request_digest": request_digest,
-                "response": response.to_dict(),
-            },
-            ensure_ascii=False,
-        )
+        payload = json.dumps({"request_digest": request_digest, "response": response.to_dict()}, ensure_ascii=False)
         try:
             with self._lock:
                 self._command("SETEX", cache_key, str(REDIS_CACHE_TTL_SECONDS), payload)
-                now = str(time.time())
-                self._command("ZADD", REDIS_INDEX_KEY, now, cache_key)
-                size = self._command("ZCARD", REDIS_INDEX_KEY)
-                if isinstance(size, int) and size > REDIS_CACHE_MAX_ENTRIES:
-                    overflow = size - REDIS_CACHE_MAX_ENTRIES
-                    oldest = self._command("ZRANGE", REDIS_INDEX_KEY, "0", str(overflow - 1))
-                    if isinstance(oldest, list):
-                        for key in oldest:
-                            text_key = key.decode("utf-8") if isinstance(key, bytes) else str(key)
-                            self._command("DEL", text_key)
-                            self._command("ZREM", REDIS_INDEX_KEY, text_key)
+                self._touch(cache_key)
+                self._trim()
         except Exception:
             return
+
+    def _touch(self, cache_key: str) -> None:
+        self._command("ZADD", REDIS_INDEX_KEY, str(time.time()), cache_key)
+
+    def _trim(self) -> None:
+        size = self._command("ZCARD", REDIS_INDEX_KEY)
+        if not isinstance(size, int) or size <= REDIS_CACHE_MAX_ENTRIES:
+            return
+        overflow = size - REDIS_CACHE_MAX_ENTRIES
+        stale_keys = self._command("ZRANGE", REDIS_INDEX_KEY, "0", str(overflow - 1))
+        if not isinstance(stale_keys, list):
+            return
+        for key in stale_keys:
+            text_key = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+            self._command("DEL", text_key)
+            self._command("ZREM", REDIS_INDEX_KEY, text_key)
 
     def _command(self, *parts: str) -> Any:
         with socket.create_connection((self.host, self.port), timeout=self.timeout_seconds) as conn:
@@ -136,62 +160,74 @@ class _RedisCacheClient:
             return _read_resp(file)
 
 
-def _redis_client() -> _RedisCacheClient | None:
-    global _REDIS_CLIENT
-    with _REDIS_CLIENT_LOCK:
-        if _REDIS_CLIENT is not None:
-            return _REDIS_CLIENT
-        if not _redis_enabled():
-            return None
-        client = _RedisCacheClient(
-            host=os.environ.get("LEGACYLENS_REDIS_HOST", REDIS_DEFAULT_HOST),
-            port=_redis_port(),
-        )
-        try:
-            with client._lock:
-                pong = client._command("PING")
-            if pong not in {b"PONG", "PONG"}:
+class ResponseCacheStore:
+    def __init__(self) -> None:
+        self._memory = MemoryResponseCache(MEMORY_CACHE_TTL_SECONDS, MEMORY_CACHE_MAX_ENTRIES)
+        self._redis: RedisResponseCache | None = None
+        self._redis_checked = False
+        self._redis_lock = threading.Lock()
+
+    def load(self, request: AnalysisRequest) -> AnalysisResponse | None:
+        cache_key = _build_cache_key(request)
+        redis_key = cache_key.redis_key()
+        request_digest = _request_digest(request)
+        redis_cache = self._redis_cache()
+        if redis_cache is not None:
+            cached = redis_cache.get(redis_key, request_digest)
+            if cached is not None:
+                return cached
+        return self._memory.get(redis_key, request_digest)
+
+    def store(self, request: AnalysisRequest, response: AnalysisResponse) -> None:
+        cache_key = _build_cache_key(request)
+        redis_key = cache_key.redis_key()
+        request_digest = _request_digest(request)
+        self._memory.set(redis_key, request_digest, response)
+        redis_cache = self._redis_cache()
+        if redis_cache is not None:
+            redis_cache.set(redis_key, request_digest, response)
+
+    def _redis_cache(self) -> RedisResponseCache | None:
+        with self._redis_lock:
+            if self._redis_checked:
+                return self._redis
+            self._redis_checked = True
+            config = _redis_config()
+            if not config.enabled:
                 return None
-        except Exception:
-            return None
-        _REDIS_CLIENT = client
-        return _REDIS_CLIENT
+            candidate = RedisResponseCache(
+                host=config.host,
+                port=config.port,
+            )
+            if not candidate.ping():
+                return None
+            self._redis = candidate
+            return self._redis
 
 
-def _redis_enabled() -> bool:
-    configured = os.environ.get("LEGACYLENS_REDIS_ENABLED")
-    if configured is not None:
-        return configured.strip().lower() in {"1", "true", "yes", "on"}
-    return True
+_CACHE = ResponseCacheStore()
 
 
-def _redis_port() -> int:
-    try:
-        return int(os.environ.get("LEGACYLENS_REDIS_PORT", str(REDIS_DEFAULT_PORT)))
-    except ValueError:
-        return REDIS_DEFAULT_PORT
+def load_cached_response(request: AnalysisRequest) -> AnalysisResponse | None:
+    return _CACHE.load(request)
 
 
-def _position_cache_key(request: AnalysisRequest) -> str:
-    file_name = _resolve_file_key(request.file_name) or "<memory>"
-    normalized_line, normalized_column = _normalized_position(request)
-    digest = hashlib.sha256()
-    digest.update(file_name.encode("utf-8", errors="replace"))
-    digest.update(b"\0")
-    digest.update((request.language or "").encode("utf-8", errors="replace"))
-    digest.update(b"\0")
-    digest.update((request.output_language or "").encode("utf-8", errors="replace"))
-    digest.update(b"\0")
-    digest.update((request.ui_language or "").encode("utf-8", errors="replace"))
-    digest.update(b"\0")
-    digest.update(request.context_scope.encode("utf-8", errors="replace"))
-    digest.update(b"\0")
-    digest.update(str(int(request.use_llm)).encode("ascii"))
-    digest.update(b"\0")
-    digest.update(str(normalized_line).encode("ascii"))
-    digest.update(b"\0")
-    digest.update(str(normalized_column).encode("ascii"))
-    return f"{REDIS_KEY_PREFIX}{digest.hexdigest()}"
+def store_cached_response(request: AnalysisRequest, response: AnalysisResponse) -> None:
+    _CACHE.store(request, response)
+
+
+def _build_cache_key(request: AnalysisRequest) -> CacheKey:
+    line_number, column_number = _normalized_position(request)
+    return CacheKey(
+        file_name=_resolve_file_key(request.file_name) or "<memory>",
+        language=request.language or "",
+        output_language=request.output_language or "",
+        ui_language=request.ui_language or "",
+        context_scope=request.context_scope,
+        use_llm=request.use_llm,
+        cursor_line=line_number,
+        cursor_column=column_number,
+    )
 
 
 def _request_digest(request: AnalysisRequest) -> str:
@@ -237,6 +273,44 @@ def _normalized_position(request: AnalysisRequest) -> tuple[int, int]:
     return line_number, column_number
 
 
+def _redis_enabled() -> bool:
+    return _redis_config().enabled
+
+
+@dataclass(frozen=True)
+class RedisConfig:
+    enabled: bool
+    host: str
+    port: int
+
+
+def _redis_config() -> RedisConfig:
+    payload, _ = load_config_payload_or_empty()
+    cache_config = mapping(payload.get("cache"))
+    redis_config = mapping(cache_config.get("redis")) or mapping(payload.get("redis"))
+
+    enabled_text = first_string(os.environ.get("LEGACYLENS_REDIS_ENABLED"), redis_config.get("enabled"))
+    if enabled_text is None:
+        enabled = True
+    else:
+        enabled = str(enabled_text).strip().lower() in {"1", "true", "yes", "on"}
+
+    host = first_string(os.environ.get("LEGACYLENS_REDIS_HOST"), redis_config.get("host"), REDIS_DEFAULT_HOST) or REDIS_DEFAULT_HOST
+    port = _int_value(os.environ.get("LEGACYLENS_REDIS_PORT"), redis_config.get("port"), default=REDIS_DEFAULT_PORT)
+    return RedisConfig(enabled=enabled, host=host, port=port)
+
+
+def _int_value(*values: Any, default: int) -> int:
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
 def _encode_resp(parts: tuple[str, ...]) -> bytes:
     encoded: list[bytes] = [f"*{len(parts)}\r\n".encode("ascii")]
     for part in parts:
@@ -246,7 +320,7 @@ def _encode_resp(parts: tuple[str, ...]) -> bytes:
     return b"".join(encoded)
 
 
-def _read_resp(file) -> Any:
+def _read_resp(file: BinaryIO) -> Any:
     prefix = file.read(1)
     if not prefix:
         raise OSError("empty redis response")
@@ -311,9 +385,7 @@ def _response_from_dict(payload: dict[str, Any]) -> AnalysisResponse:
             current_file=context_payload.get("current_file"),
             files=[str(item) for item in context_payload.get("files", []) if item is not None],
             related_files=[str(item) for item in context_payload.get("related_files", []) if item is not None],
-            symbol_references=[
-                item for item in context_payload.get("symbol_references", []) if isinstance(item, dict)
-            ],
+            symbol_references=[item for item in context_payload.get("symbol_references", []) if isinstance(item, dict)],
             notes=[str(item) for item in context_payload.get("notes", []) if item is not None],
         )
 

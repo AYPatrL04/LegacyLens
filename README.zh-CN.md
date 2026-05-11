@@ -121,6 +121,13 @@ Get-Content sample.c | python -m legacylens analyze - --language c --output-lang
   "logging": {
     "level": "INFO"
   },
+  "cache": {
+    "redis": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 6379
+    }
+  },
   "llm": {
     "mode": "local",
     "timeoutSeconds": 60,
@@ -148,6 +155,9 @@ Get-Content sample.c | python -m legacylens analyze - --language c --output-lang
 
 - `outputLanguage`: 解释输出语言。解析优先级是配置文件、VS Code locale、系统语言。
 - `logging.level`: `DEBUG`、`INFO`、`WARNING`、`ERROR` 等 Python 日志级别。
+- `cache.redis.enabled`: 是否启用 Redis 持久化悬停/分析缓存。关闭后仅使用进程内内存缓存。
+- `cache.redis.host`: Redis 主机地址，用于持久化悬停/分析缓存。
+- `cache.redis.port`: Redis 端口，用于持久化悬停/分析缓存。
 - `llm.mode`: `local` 或 `api`。
 - `llm.timeoutSeconds`: LLM 生成超时。
 - `llm.model`: 通用模型名；`local.model` 或 `api.model` 会优先于它。

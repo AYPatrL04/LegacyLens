@@ -17,7 +17,7 @@ import httpx
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Protocol
 
-from .config import find_config_path, load_config_payload
+from .config import load_config_payload
 from .i18n import ENGLISH, OutputLanguage, resolve_output_language
 from .models import AnalysisRequest, Finding, ProjectContext
 
@@ -366,13 +366,6 @@ class OllamaClient:
     provider: str = field(default="ollama", init=False)
 
     @classmethod
-    def from_environment(cls) -> "OllamaClient | None":
-        config = load_llm_config()
-        if config.mode != "local":
-            return None
-        return cls.from_config(config)
-
-    @classmethod
     def from_config(cls, config: LlmConfig) -> "OllamaClient | None":
         host = normalize_ollama_host(config.ollama_host)
         model = config.ollama_model or config.model
@@ -384,14 +377,6 @@ class OllamaClient:
         if not model:
             return None
         return cls(host=host, model=model, timeout_seconds=config.timeout_seconds)
-
-    @classmethod
-    def discover(cls, host: str | None = None) -> "OllamaClient | None":
-        resolved_host = normalize_ollama_host(host or os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST))
-        model = discover_ollama_model(resolved_host)
-        if not model:
-            return None
-        return cls(host=resolved_host, model=model)
 
     def generate(self, prompt: str) -> str:
         with OLLAMA_CALL_LOCK:
@@ -1413,13 +1398,6 @@ def _float_value(*values: Any, default: float) -> float:
 
 def _truthy(value: str | None) -> bool:
     return bool(value and value.strip().lower() in {"1", "true", "yes", "on"})
-
-
-def _float_from_environment(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, ""))
-    except ValueError:
-        return default
 
 
 def _strip_thinking(text: str) -> str:

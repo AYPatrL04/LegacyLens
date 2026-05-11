@@ -121,6 +121,13 @@ Unified template:
   "logging": {
     "level": "INFO"
   },
+  "cache": {
+    "redis": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 6379
+    }
+  },
   "llm": {
     "mode": "local",
     "timeoutSeconds": 60,
@@ -150,6 +157,9 @@ Config fields:
 
 - `outputLanguage`: explanation language. Resolution priority is config file, then VS Code locale, then system language.
 - `logging.level`: `DEBUG`, `INFO`, `WARNING`, `ERROR`, and similar Python logging levels.
+- `cache.redis.enabled`: enables Redis-backed hover/result caching. When false, Legacy Lens uses only the in-process memory cache.
+- `cache.redis.host`: Redis host for persisted hover/result cache entries.
+- `cache.redis.port`: Redis port for persisted hover/result cache entries.
 - `llm.mode`: `local` or `api`.
 - `llm.timeoutSeconds`: generation timeout.
 - `llm.parallelSections`: when true, split the final explanation into multiple section prompts and generate them concurrently.
